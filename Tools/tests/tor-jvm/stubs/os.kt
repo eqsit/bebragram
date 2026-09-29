@@ -28,3 +28,4 @@ class Parcel {
 }
 object Build { object VERSION { const val SDK_INT = 36 } }
 object Process { fun myPid() = 42; fun killProcess(pid: Int) {} }
+object SystemClock { fun elapsedRealtime() = org.telegram.messenger.AndroidUtilities.elapsedRealtime() }

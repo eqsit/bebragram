@@ -5,10 +5,10 @@ class NetworkCapabilities {
     fun hasCapability(capability: Int) = true
 }
 class ConnectivityManager {
-    companion object { val network = Network() }
+    companion object { var network = Network(); var callback: NetworkCallback? = null }
     val activeNetwork: Network? get() = network
     fun getNetworkCapabilities(network: Network) = NetworkCapabilities()
-    fun registerDefaultNetworkCallback(callback: NetworkCallback) {}
+    fun registerDefaultNetworkCallback(callback: NetworkCallback) { Companion.callback = callback }
     open class NetworkCallback {
         open fun onAvailable(network: Network) {}
         open fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {}

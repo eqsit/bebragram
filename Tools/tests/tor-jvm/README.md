@@ -7,5 +7,8 @@ sources and runs them with small JVM doubles for Android, IPtProxy and Telegram.
 Checks: stop before service connection; restart only after Binder death; duplicate
 old death and stale error broadcasts; no synchronous Binder IPC on UI; cancellation
 of a queued restart; control exceptions; unexpected process death; VPN pause/resume;
-default autostart and explicit opt-out. Android/device behavior still needs an APK
+default autostart and explicit opt-out; bridge downloads preserve an established
+connection; manual refresh retries an unfinished bootstrap; network changes reuse
+the connected session's bridges; automatic bootstrap stalls retry after 45 seconds.
+HTTPS requests and the monotonic clock are stubbed locally. Android/device behavior still needs an APK
 smoke test; this harness does not simulate Android's process manager or native Tor.

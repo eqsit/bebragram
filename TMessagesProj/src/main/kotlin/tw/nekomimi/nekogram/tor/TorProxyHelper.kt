@@ -13,6 +13,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.edit
 import tw.nekomimi.nekogram.utils.ProxyUtil
@@ -41,6 +42,7 @@ object TorProxyHelper {
     private var bound = false
     private var connection: ServiceConnection? = null
     private var service: TorRemote? = null
+    private var pendingNetworkBridges: Triple<String, String, Boolean>? = null
     private var torBinder: IBinder? = null
     private val startedTransports = mutableListOf<String>()
     private var localProxy: SharedConfig.ProxyInfo? = null
@@ -116,14 +118,21 @@ object TorProxyHelper {
             controlWorker.execute {
                 try {
                     var lastPhase = ""
+                    var highestProgress = -1
+                    var lastProgressAt = SystemClock.elapsedRealtime()
                     for (i in 0 until 600) {
                         if (token != generation) return@execute
                         if (tor.controlReady) {
                             val phase = tor.getInfo("status/bootstrap-phase")
+                            if (token != generation) return@execute
                             if (phase != null && phase != lastPhase) {
                                 lastPhase = phase
                                 Regex("PROGRESS=(\\d+)").find(phase)?.let { progress = it.groupValues[1].toInt() }
                                 TorLog.add("bootstrap: $phase")
+                            }
+                            if (progress > highestProgress) {
+                                highestProgress = progress
+                                lastProgressAt = SystemClock.elapsedRealtime()
                             }
                             // Poll the control port instead of relying on broadcasts, which can be missed.
                             val port = tor.socksPort
@@ -140,6 +149,13 @@ object TorProxyHelper {
                                             scheduleHealthCheck()
                                         }
                                     }
+                                }
+                                return@execute
+                            }
+                            if (activeAutoBridges && highestProgress in 0..79 &&
+                                SystemClock.elapsedRealtime() - lastProgressAt >= 45_000L) {
+                                AndroidUtilities.runOnUIThread {
+                                    if (token == generation) fail("Tor bootstrap stalled at $highestProgress%")
                                 }
                                 return@execute
                             }
@@ -259,7 +275,7 @@ object TorProxyHelper {
                 (status == "ON" || status == "STARTING")) {
                 networkChanged = false
                 TorLog.add("default network changed; restarting Tor")
-                restartForNewBridges()
+                restartForNewBridges(keepCurrentBridges = true)
             } else {
                 networkChanged = false
             }
@@ -336,6 +352,8 @@ object TorProxyHelper {
         stopError = null
         progress = -1
         lastError = null
+        val networkBridges = pendingNetworkBridges
+        pendingNetworkBridges = null
         AndroidUtilities.runOnUIThread({
             if (token == generation && status == "STARTING" && service == null) fail("Tor service start timed out")
         }, 60_000)
@@ -343,7 +361,12 @@ object TorProxyHelper {
             try {
                 val mode = TorConfig.mode
                 TorLog.add("start: mode=$mode")
-                val bridges = bridgeLines(mode)
+                val bridges = if (networkBridges != null && networkBridges.first == mode) {
+                    activeBridgeLines = networkBridges.second
+                    activeAutoBridges = networkBridges.third
+                    TorLog.add("bridges: reusing the connected session's bridges after network change")
+                    networkBridges.second
+                } else bridgeLines(mode)
                 if (token != generation) {
                     TorLog.add("start cancelled before transports")
                     return@execute
@@ -405,6 +428,7 @@ object TorProxyHelper {
         reconnectWhenVpnOff = false
         ++generation
         startQueued = false
+        pendingNetworkBridges = null
         stopError = null
         healthCheckScheduled = false
         missedHealthChecks = 0
@@ -638,11 +662,17 @@ object TorProxyHelper {
 
     /**
      * Fetches fresh bridges for the current mode, stores them as the active bridge lines
-     * (auto-managed, so the scheduler may overwrite them later) and restarts Tor if needed.
+     * (auto-managed, so the scheduler may overwrite them later). An established
+     * connection keeps its current bridges until the next start. A manual refresh
+     * retries an unfinished bootstrap immediately with the new bridges.
      * Callback runs on the UI thread: line count, or -1 on failure.
      */
     @JvmStatic
     fun refreshBridges(callback: java.util.function.IntConsumer? = null) {
+        refreshBridgesInternal(restartStarting = true, callback = callback)
+    }
+
+    private fun refreshBridgesInternal(restartStarting: Boolean, callback: java.util.function.IntConsumer?) {
         android.util.Log.d("BebragramTor", "refreshBridges: mode=${TorConfig.mode} enabled=${TorConfig.enabled}")
         if (!::app.isInitialized) {
             callback?.accept(-1)
@@ -695,16 +725,24 @@ object TorProxyHelper {
                 TorConfig.setAutoManagedFor(mode, true)
                 TorConfig.setLastBridgeRefreshFor(mode, System.currentTimeMillis())
                 TorLog.add("bridges: refreshed $count $mode line(s)")
-                val restart = TorConfig.enabled
+                val restart = TorConfig.enabled && status != "ON" &&
+                    (status != "STARTING" || restartStarting)
+                if (TorConfig.enabled && !restart) {
+                    TorLog.add("bridges: saved for the next start; keeping current Tor session")
+                }
                 callback?.accept(count)
                 if (restart && token == generation && TorConfig.enabled && TorConfig.mode == mode) restartForNewBridges()
             }
         }
     }
 
-    private fun restartForNewBridges() {
-        TorLog.add("restarting Tor with refreshed bridges")
+    private fun restartForNewBridges(keepCurrentBridges: Boolean = false) {
+        val reusable = if (keepCurrentBridges && status == "ON" && activeBridgeLines.isNotBlank()) {
+            Triple(TorConfig.mode, activeBridgeLines, activeAutoBridges)
+        } else null
+        TorLog.add(if (reusable != null) "restarting Tor with the connected session's bridges" else "restarting Tor with refreshed bridges")
         stop()
+        pendingNetworkBridges = reusable
         start()
     }
 
@@ -722,7 +760,7 @@ object TorProxyHelper {
         val due = System.currentTimeMillis() - TorConfig.lastBridgeRefreshFor(mode) >= hours * 3600_000L
         if (due) {
             TorLog.add("auto-refresh: bridges are older than $hours h")
-            refreshBridges()
+            refreshBridgesInternal(restartStarting = false, callback = null)
         }
     }
 

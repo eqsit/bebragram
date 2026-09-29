@@ -12,7 +12,10 @@ Pinned sources:
 - uTLS replacement: gitlab.torproject.org/shelikhoo/utls-temporary v0.0.0-20260114141111-0f042ad603ef
 - Go: 1.26.4; gomobile/gobind: v0.0.0-20260611195102-4dd8f1dbf5d2
 
-IPtProxy sources are copied unchanged. DNSTT fixes a reversed `errors.As` call in
+IPtProxy keeps randomized WebTunnel ClientHello fingerprints while ensuring they
+advertise TLS 1.3 support, with TLS 1.2 compatibility and unchanged certificate
+verification. This prevents random failures against TLS-1.3-only bridge fronts.
+DNSTT fixes a reversed `errors.As` call in
 the SOCKS accept loop so temporary network errors are detected correctly. The root
 module also adds the uTLS replacement, checksums and TLS regression test. Licenses
 are included.
@@ -29,6 +32,10 @@ cd ../dnstt
 go test ./...
 ```
 
-The regression uses a local TLS server with ML-KEM enabled and 128 deterministic
-randomized WebTunnel fingerprints. Certificates are verified against a local test
-CA. It fails with upstream uTLS 1.8.2 and passes with the pinned Tor fork.
+The regression uses local TLS servers with ML-KEM enabled and 128 deterministic
+randomized WebTunnel fingerprints per server: TLS 1.2/1.3, TLS 1.3 only, and TLS
+1.2 only. It selects the fingerprint through Lyrebird's production parser.
+Certificates are verified against a local test CA. The mixed-version regression
+fails with upstream uTLS 1.8.2; the TLS-1.3-only regression also fails with the
+unmodified randomized fingerprint. All 384 handshakes pass with the pinned fork
+and the TLS-version weight adjustment.

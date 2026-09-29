@@ -6,7 +6,8 @@ object AndroidUtilities {
     val uiThread = Thread.currentThread()
     private val queue = ConcurrentLinkedQueue<Runnable>()
     private val delayed = mutableListOf<Pair<Long, Runnable>>()
-    private var clock = 0L
+    @Volatile private var clock = 0L
+    fun elapsedRealtime() = clock
     fun runOnUIThread(task: Runnable) { queue.add(task) }
     @Synchronized fun runOnUIThread(task: Runnable, delay: Long) { delayed.add(clock+delay to task) }
     @Synchronized fun cancelRunOnUIThread(task: Runnable) { delayed.removeAll { it.second === task } }

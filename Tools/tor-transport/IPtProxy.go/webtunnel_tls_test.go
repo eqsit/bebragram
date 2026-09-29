@@ -14,11 +14,25 @@ import (
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+	"gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/common/utlsutil"
 )
 
 // Exercise the fingerprint used by Lyrebird against a real Go TLS server with
 // ML-KEM enabled. A lost root-module replace regresses this to unsupported HRRs.
 func TestWebTunnelRandomizedHandshake(t *testing.T) {
+	testWebTunnelHandshake(t, tls.VersionTLS12, tls.VersionTLS13)
+}
+
+func TestWebTunnelTLS13OnlyHandshake(t *testing.T) {
+	testWebTunnelHandshake(t, tls.VersionTLS13, tls.VersionTLS13)
+}
+
+func TestWebTunnelTLS12OnlyHandshake(t *testing.T) {
+	testWebTunnelHandshake(t, tls.VersionTLS12, tls.VersionTLS12)
+}
+
+func testWebTunnelHandshake(t *testing.T, minVersion, maxVersion uint16) {
+	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -42,7 +56,7 @@ func TestWebTunnelRandomizedHandshake(t *testing.T) {
 	}
 	defer listener.Close()
 	config := &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
-		MinVersion: tls.VersionTLS12, MaxVersion: tls.VersionTLS13,
+		MinVersion: minVersion, MaxVersion: maxVersion,
 		CurvePreferences: []tls.CurveID{tls.X25519MLKEM768, tls.X25519, tls.CurveP256, tls.CurveP384, tls.CurveP521}}
 	results := make(chan error, 1)
 	go func() {
@@ -63,7 +77,11 @@ func TestWebTunnelRandomizedHandshake(t *testing.T) {
 			t.Fatal(err)
 		}
 		seed := utls.PRNGSeed(sha256.Sum256([]byte(fmt.Sprintf("webtunnel-regression-%d", i))))
-		id := utls.HelloRandomizedNoALPN
+		fingerprint, err := utlsutil.ParseClientHelloID("hellorandomizednoalpn")
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := *fingerprint
 		id.Seed = &seed
 		client := utls.UClient(conn, &utls.Config{ServerName: "localhost", RootCAs: roots}, id)
 		_ = client.SetDeadline(time.Now().Add(3 * time.Second))

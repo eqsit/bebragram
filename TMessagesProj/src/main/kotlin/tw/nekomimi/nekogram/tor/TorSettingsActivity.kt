@@ -40,12 +40,26 @@ class TorSettingsActivity : UniversalFragment() {
         ticker = null
     }
 
-    /** Tor bootstraps in the background, so keep the status row live while the page is open. */
+    /** Observe local state while this page is visible; redraw only when it changes. */
     private fun scheduleTick() {
         ticker?.let { AndroidUtilities.cancelRunOnUIThread(it) }
-        val runnable = Runnable {
-            listView?.adapter?.update(true)
-            if (TorConfig.enabled && TorProxyHelper.status != "ON") scheduleTick()
+        val runnable = object : Runnable {
+            private var lastStatus = statusText()
+            private var lastEnabled = TorConfig.enabled
+            private var lastError = TorProxyHelper.lastError
+
+            override fun run() {
+                val status = statusText()
+                val enabled = TorConfig.enabled
+                val error = TorProxyHelper.lastError
+                if (status != lastStatus || enabled != lastEnabled || error != lastError) {
+                    lastStatus = status
+                    lastEnabled = enabled
+                    lastError = error
+                    listView?.adapter?.update(true)
+                }
+                AndroidUtilities.runOnUIThread(this, 1000)
+            }
         }
         ticker = runnable
         AndroidUtilities.runOnUIThread(runnable, 1000)
