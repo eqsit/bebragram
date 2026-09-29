@@ -76,6 +76,7 @@ import tw.nekomimi.nekogram.tor.TorProxyHelper;
 import tw.nekomimi.nekogram.tor.TorSettingsActivity;
 import tw.nekomimi.nekogram.utils.AlertUtil;
 import tw.nekomimi.nekogram.utils.ProxyUtil;
+import xyz.nextalone.nagram.NaConfig;
 
 public class ProxyListActivity extends BaseFragment implements NotificationCenter.NotificationCenterDelegate {
     private final static boolean IS_PROXY_ROTATION_AVAILABLE = true;
@@ -95,6 +96,7 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
     private int rowCount;
     @Keep
     private int useProxyRow;
+    private int disableProxyWhenVpnRow;
     private int useProxyShadowRow;
     private int connectionsHeaderRow;
     private int proxyStartRow;
@@ -505,6 +507,11 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
                 editor.commit();
 
                 ConnectionsManager.setProxySettings(useProxySettings, SharedConfig.currentProxy.address, SharedConfig.currentProxy.port, SharedConfig.currentProxy.username, SharedConfig.currentProxy.password, SharedConfig.currentProxy.secret);
+                if (!useProxySettings) {
+                    TorProxyHelper.onOtherProxySelected();
+                    ProxyUtil.forgetVpnProxyRestore();
+                }
+                ProxyUtil.recheckProxyState();
                 NotificationCenter.getGlobalInstance().removeObserver(ProxyListActivity.this, NotificationCenter.proxySettingsChanged);
                 NotificationCenter.getGlobalInstance().postNotificationName(NotificationCenter.proxySettingsChanged);
                 NotificationCenter.getGlobalInstance().addObserver(ProxyListActivity.this, NotificationCenter.proxySettingsChanged);
@@ -516,6 +523,15 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
                         cell.updateStatus();
                     }
                 }
+            } else if (position == disableProxyWhenVpnRow) {
+                boolean enabled = !NaConfig.INSTANCE.getDisableProxyWhenVpnEnabled().Bool();
+                NaConfig.INSTANCE.getDisableProxyWhenVpnEnabled().setConfigBool(enabled);
+                ((TextCheckCell) view).setChecked(enabled);
+                if (enabled) {
+                    ProxyUtil.registerNetworkCallback();
+                }
+                TorProxyHelper.INSTANCE.onVpnPreferenceChanged();
+                ProxyUtil.recheckProxyState();
             } else if (position == rotationRow) {
                 SharedConfig.proxyRotationEnabled = !SharedConfig.proxyRotationEnabled;
                 TextCheckCell textCheckCell = (TextCheckCell) view;
@@ -536,6 +552,9 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
                     return;
                 }
                 SharedConfig.ProxyInfo info = proxyList.get(position - proxyStartRow);
+                if (!TorProxyHelper.isTorProxy(info)) {
+                    TorProxyHelper.onOtherProxySelected();
+                }
                 useProxySettings = true;
                 SharedPreferences.Editor editor = MessagesController.getGlobalMainSettings().edit();
                 editor.putString("proxy_ip", info.address);
@@ -565,6 +584,7 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
                     textCheckCell.setChecked(true);
                 }
                 ConnectionsManager.setProxySettings(useProxySettings, SharedConfig.currentProxy.address, SharedConfig.currentProxy.port, SharedConfig.currentProxy.username, SharedConfig.currentProxy.password, SharedConfig.currentProxy.secret);
+                ProxyUtil.recheckProxyState();
             } else if (position == torRow) {
                 presentFragment(new TorSettingsActivity());
             } else if (position == proxyAddRow) {
@@ -701,6 +721,7 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
     private void updateRows(boolean notify) {
         rowCount = 0;
         useProxyRow = rowCount++;
+        disableProxyWhenVpnRow = rowCount++;
         if (useProxySettings && SharedConfig.currentProxy != null && SharedConfig.proxyList.size() > 1 && IS_PROXY_ROTATION_AVAILABLE) {
             rotationRow = rowCount++;
             if (SharedConfig.proxyRotationEnabled) {
@@ -987,7 +1008,9 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
                 case VIEW_TYPE_TEXT_CHECK: {
                     TextCheckCell checkCell = (TextCheckCell) holder.itemView;
                     if (position == useProxyRow) {
-                        checkCell.setTextAndCheck(getString(R.string.UseProxySettings), useProxySettings, rotationRow != -1);
+                        checkCell.setTextAndCheck(getString(R.string.UseProxySettings), useProxySettings, true);
+                    } else if (position == disableProxyWhenVpnRow) {
+                        checkCell.setTextAndCheck(getString(R.string.DisableProxyWhenVpnEnabled), NaConfig.INSTANCE.getDisableProxyWhenVpnEnabled().Bool(), true);
                     } else if (position == callsRow) {
                         checkCell.setTextAndCheck(getString(R.string.UseProxyForCalls), useProxyForCalls, false);
                     } else if (position == rotationRow) {
@@ -1047,6 +1070,8 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
                 TextCheckCell checkCell = (TextCheckCell) holder.itemView;
                 if (position == useProxyRow) {
                     checkCell.setChecked(useProxySettings);
+                } else if (position == disableProxyWhenVpnRow) {
+                    checkCell.setChecked(NaConfig.INSTANCE.getDisableProxyWhenVpnEnabled().Bool());
                 } else if (position == callsRow) {
                     checkCell.setChecked(useProxyForCalls);
                 } else if (position == rotationRow) {
@@ -1065,6 +1090,8 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
                 int position = holder.getAdapterPosition();
                 if (position == useProxyRow) {
                     checkCell.setChecked(useProxySettings);
+                } else if (position == disableProxyWhenVpnRow) {
+                    checkCell.setChecked(NaConfig.INSTANCE.getDisableProxyWhenVpnEnabled().Bool());
                 } else if (position == callsRow) {
                     checkCell.setChecked(useProxyForCalls);
                 } else if (position == rotationRow) {
@@ -1076,7 +1103,7 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
         @Override
         public boolean isEnabled(RecyclerView.ViewHolder holder) {
             int position = holder.getAdapterPosition();
-            return position == useProxyRow || position == rotationRow || position == callsRow || position == proxyAddRow || position == deleteAllRow || position == torRow || position >= proxyStartRow && position < proxyEndRow;
+            return position == useProxyRow || position == disableProxyWhenVpnRow || position == rotationRow || position == callsRow || position == proxyAddRow || position == deleteAllRow || position == torRow || position >= proxyStartRow && position < proxyEndRow;
         }
 
         @Override
@@ -1128,6 +1155,8 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
                 return -12;
             } else if (position == useProxyRow) {
                 return -4;
+            } else if (position == disableProxyWhenVpnRow) {
+                return -13;
             } else if (position == callsRow) {
                 return -5;
             } else if (position == connectionsHeaderRow) {
@@ -1153,7 +1182,7 @@ public class ProxyListActivity extends BaseFragment implements NotificationCente
                 return VIEW_TYPE_SHADOW;
             } else if (position == proxyAddRow || position == deleteAllRow || position == torRow) {
                 return VIEW_TYPE_TEXT_SETTING;
-            } else if (position == useProxyRow || position == rotationRow || position == callsRow) {
+            } else if (position == useProxyRow || position == disableProxyWhenVpnRow || position == rotationRow || position == callsRow) {
                 return VIEW_TYPE_TEXT_CHECK;
             } else if (position == connectionsHeaderRow) {
                 return VIEW_TYPE_HEADER;

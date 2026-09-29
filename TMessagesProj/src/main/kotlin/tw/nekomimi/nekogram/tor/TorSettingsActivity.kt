@@ -45,7 +45,7 @@ class TorSettingsActivity : UniversalFragment() {
         ticker?.let { AndroidUtilities.cancelRunOnUIThread(it) }
         val runnable = Runnable {
             listView?.adapter?.update(true)
-            if (TorProxyHelper.status == "STARTING" || TorProxyHelper.status == "STOPPING") scheduleTick()
+            if (TorConfig.enabled && TorProxyHelper.status != "ON") scheduleTick()
         }
         ticker = runnable
         AndroidUtilities.runOnUIThread(runnable, 1000)
@@ -54,14 +54,18 @@ class TorSettingsActivity : UniversalFragment() {
     private fun statusText(): String = when {
         TorProxyHelper.status == "STARTING" && TorProxyHelper.progress in 0..99 -> "Starting… ${TorProxyHelper.progress}%"
         TorProxyHelper.status == "ON" -> "Connected"
+        TorProxyHelper.status == "STOPPING" && TorConfig.enabled -> "Restarting…"
         TorProxyHelper.status == "STOPPING" -> "Stopping…"
+        TorProxyHelper.status == "WAITING_FOR_NETWORK" -> "Waiting for internet…"
+        TorProxyHelper.status == "WAITING_FOR_VPN" -> "Waiting for VPN to turn off…"
         else -> TorProxyHelper.status
     }
 
     private fun bridgeSummary(): String {
         val manual = TorConfig.bridgesFor(TorConfig.mode)
         return when {
-            manual.isNotBlank() -> LocaleController.getString(R.string.BebragramTorCustom)
+            manual.isNotBlank() && !TorConfig.autoManagedFor(TorConfig.mode) ->
+                LocaleController.getString(R.string.BebragramTorCustom)
             TorConfig.mode == "direct" -> LocaleController.getString(R.string.BebragramTorNotNeeded)
             else -> LocaleController.getString(R.string.BebragramTorAutoBridges)
         }
@@ -107,7 +111,7 @@ class TorSettingsActivity : UniversalFragment() {
 
     override fun onLongClick(item: UItem, view: View, position: Int, x: Float, y: Float): Boolean = false
 
-    /** Fetches fresh WebTunnel bridges (the same source @GetBridgesBot uses) and inserts them. */
+    /** Fetches a few responsive candidates from the configured GitHub bridge lists. */
     private fun fetchBridgesNow() {
         BulletinFactory.of(this)
             .createSimpleBulletin(R.raw.copy, LocaleController.getString(R.string.BebragramTorFetching)).show()
@@ -172,8 +176,8 @@ class TorSettingsActivity : UniversalFragment() {
     private fun setAutoRefreshHours(hours: Int) {
         TorConfig.bridgeAutoRefreshHours = hours
         if (hours > 0) {
-            TorConfig.bridgesAutoManaged = true
-            TorConfig.lastBridgeRefresh = 0L
+            TorConfig.setAutoManagedFor(TorConfig.mode, true)
+            TorConfig.setLastBridgeRefreshFor(TorConfig.mode, 0L)
             fetchBridgesNow()
         } else {
             listView?.adapter?.update(true)
@@ -214,7 +218,7 @@ class TorSettingsActivity : UniversalFragment() {
                     if (text.isNotEmpty()) TorBridgeConfig.transports(TorConfig.mode, text)
                     if (TorConfig.enabled) TorProxyHelper.stop()
                     TorConfig.setBridgesFor(TorConfig.mode, text)
-                    TorConfig.bridgesAutoManaged = false
+                    TorConfig.setAutoManagedFor(TorConfig.mode, false)
                     listView.adapter.update(true)
                 } catch (e: Exception) {
                     showError(e.localizedMessage ?: "Invalid bridge")

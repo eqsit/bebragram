@@ -346,7 +346,7 @@
     <string name="BebragramTorMode">Режим подключения</string>
     <string name="BebragramTorBridgeLines">Строки мостов</string>
     <string name="BebragramTorBridgeHint">Вставьте строки мостов (по одной в строке)</string>
-    <string name="BebragramTorAutoBridges">Авто (torproject.org)</string>
+    <string name="BebragramTorAutoBridges">Авто (списки GitHub)</string>
     <string name="BebragramTorNotNeeded">Не требуется</string>
     <string name="BebragramTorCustom">Свои мосты</string>
     <string name="BebragramTorStatus">Статус</string>
@@ -356,7 +356,7 @@
     <string name="BebragramTorError">Последняя ошибка</string>
     <string name="BebragramTorHelp">Tor подключается до включения прокси Telegram. Другие прокси восстанавливаются при отключении Tor. Звонки и встроенные веб-страницы не гарантированно идут через Tor.</string>
     <string name="BebragramTorFetch">Получить мосты</string>
-    <string name="BebragramTorFetchInfo">Свежие WebTunnel-мосты подтягиваются и вставляются автоматически — это тот же источник, что у @GetBridgesBot. Чат с ботом не нужен.</string>
+    <string name="BebragramTorFetchInfo">Проверяются до 12 кандидатов из списков GitHub, сохраняются три доступных моста. Соединение проверяет сам Tor.</string>
     <string name="BebragramTorAutoRefresh">Автообновление мостов</string>
     <string name="BebragramTorAutoOff">Выкл</string>
     <string name="BebragramTorAutoCustom">Другое…</string>
@@ -365,7 +365,7 @@
     <string name="BebragramTorFetched">Мосты обновлены: %1$d</string>
     <string name="BebragramTorFetchFailed">Не удалось получить мосты</string>
     <string name="BebragramTorFetching">Получаю мосты…</string>
-    <string name="BebragramTorBridgeHintInfo">Оставьте пустым, чтобы получить свежие мосты с torproject.org. Вставьте свои строки, чтобы переопределить.</string>
+    <string name="BebragramTorBridgeHintInfo">Оставьте пустым для списков GitHub. Вставьте свои строки, чтобы переопределить.</string>
     <!-- bebragram: редактор главного меню -->
     <string name="BebragramMainMenu">Главное меню</string>
     <string name="BebragramMainMenuItems">Элементы меню</string>

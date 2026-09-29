@@ -121,7 +121,6 @@ public class NekoGeneralSettingsActivity extends BaseNekoXSettingsActivity {
     // Connections
     private final AbstractConfigCell headerConnection = cellGroup.appendCell(new ConfigCellHeader(getString(R.string.Connection)));
     private final AbstractConfigCell useIPv6Row = cellGroup.appendCell(new ConfigCellTextCheck(NekoConfig.useIPv6));
-    private final AbstractConfigCell disableProxyWhenVpnEnabledRow = cellGroup.appendCell(new ConfigCellTextCheck(NaConfig.INSTANCE.getDisableProxyWhenVpnEnabled()));
     /** bebragram: embedded Tor. */
     private final AbstractConfigCell torNetworkRow = cellGroup.appendCell(new ConfigCellText("BebragramTorNetwork", () -> presentFragment(new TorSettingsActivity())));
     private final AbstractConfigCell defaultHlsVideoQualityRow = cellGroup.appendCell(new ConfigCellSelectBox(null, NaConfig.INSTANCE.getDefaultHlsVideoQuality(), new String[]{

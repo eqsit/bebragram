@@ -320,6 +320,11 @@ public class ApplicationLoader extends Application {
         }
 
         super.onCreate();
+        // The embedded Tor service has its own short-lived process. Do not start Telegram's
+        // native clients, proxy rotation or account services in that process.
+        if (tw.nekomimi.nekogram.tor.TorProxyHelper.isTorProcess()) {
+            return;
+        }
         installCrashReportFilter();
 
         if (BuildVars.LOGS_ENABLED) {

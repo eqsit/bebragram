@@ -61,25 +61,7 @@ object ProxyUtil {
         val networkCallback: ConnectivityManager.NetworkCallback =
             object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
-                    val networkCapabilities =
-                        connectivityManager.getNetworkCapabilities(network) ?: return
-                    val vpn = networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
-                    if (!vpn) {
-                        if (SharedConfig.currentProxy == null) {
-                            if (!SharedConfig.proxyList.isEmpty()) {
-                                SharedConfig.setCurrentProxy(SharedConfig.proxyList[0])
-                            } else {
-                                return
-                            }
-                        }
-                    }
-                    if ((SharedConfig.isProxyEnabled() && vpn) || (!SharedConfig.isProxyEnabled() && !vpn)) {
-                        SharedConfig.setProxyEnable(!vpn)
-                        AndroidUtilities.runOnUIThread {
-                            NotificationCenter.getGlobalInstance()
-                                .postNotificationName(NotificationCenter.proxySettingsChanged)
-                        }
-                    }
+                    AndroidUtilities.runOnUIThread { recheckProxyState() }
                 }
             }
 
@@ -105,21 +87,24 @@ object ProxyUtil {
     /** Re-apply the VPN proxy rules after Tor connects or stops, where no network callback fires. */
     @JvmStatic
     fun recheckProxyState() {
-        val vpn = isVpnActiveNow()
-        if (!vpn && SharedConfig.currentProxy == null) {
-            if (SharedConfig.proxyList.isNotEmpty()) {
-                SharedConfig.setCurrentProxy(SharedConfig.proxyList[0])
-            } else {
-                return
+        val prefs = ApplicationLoader.applicationContext.getSharedPreferences("bebragram", Context.MODE_PRIVATE)
+        val suppressed = isVpnProxySuppressionActive()
+        val disabledByVpn = prefs.getBoolean("proxy_disabled_by_vpn", false)
+        if (suppressed && SharedConfig.isProxyEnabled()) {
+            prefs.edit().putBoolean("proxy_disabled_by_vpn", true).apply()
+            SharedConfig.setProxyEnable(false)
+        } else if (!suppressed && disabledByVpn) {
+            prefs.edit().remove("proxy_disabled_by_vpn").apply()
+            if (SharedConfig.currentProxy != null && !tw.nekomimi.nekogram.tor.TorConfig.enabled) {
+                SharedConfig.setProxyEnable(true)
             }
         }
-        if ((SharedConfig.isProxyEnabled() && vpn) || (!SharedConfig.isProxyEnabled() && !vpn)) {
-            SharedConfig.setProxyEnable(!vpn)
-            AndroidUtilities.runOnUIThread {
-                NotificationCenter.getGlobalInstance()
-                    .postNotificationName(NotificationCenter.proxySettingsChanged)
-            }
-        }
+    }
+
+    @JvmStatic
+    fun forgetVpnProxyRestore() {
+        ApplicationLoader.applicationContext.getSharedPreferences("bebragram", Context.MODE_PRIVATE)
+            .edit().remove("proxy_disabled_by_vpn").apply()
     }
 
     @JvmStatic

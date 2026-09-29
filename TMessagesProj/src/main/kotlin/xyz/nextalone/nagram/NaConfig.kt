@@ -220,7 +220,7 @@ object NaConfig {
         addConfig(
             "DisableProxyWhenVpnEnabled",
             ConfigItem.configTypeBool,
-            false
+            true
         )
     val notificationIcon =
         addConfig(

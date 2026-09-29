@@ -361,7 +361,7 @@
     <string name="BebragramTorMode">Connection mode</string>
     <string name="BebragramTorBridgeLines">Bridge lines</string>
     <string name="BebragramTorBridgeHint">Paste bridge lines (one per line)</string>
-    <string name="BebragramTorAutoBridges">Auto (torproject.org)</string>
+    <string name="BebragramTorAutoBridges">Auto (GitHub lists)</string>
     <string name="BebragramTorNotNeeded">Not needed</string>
     <string name="BebragramTorCustom">Custom bridges</string>
     <string name="BebragramTorStatus">Status</string>
@@ -371,7 +371,7 @@
     <string name="BebragramTorError">Last error</string>
     <string name="BebragramTorHelp">Tor connects before the Telegram proxy is enabled. Other proxies are restored when Tor is turned off. Calls and embedded web pages are not guaranteed to use Tor.</string>
     <string name="BebragramTorFetch">Get bridges</string>
-    <string name="BebragramTorFetchInfo">Fresh WebTunnel bridges are fetched and inserted automatically — the same source @GetBridgesBot uses. No bot chat needed.</string>
+    <string name="BebragramTorFetchInfo">Checks up to 12 candidates from GitHub lists and keeps three responsive bridges. Tor verifies the connection.</string>
     <string name="BebragramTorAutoRefresh">Auto-refresh bridges</string>
     <string name="BebragramTorAutoOff">Off</string>
     <string name="BebragramTorAutoCustom">Custom…</string>
@@ -380,7 +380,7 @@
     <string name="BebragramTorFetched">Bridges updated: %1$d</string>
     <string name="BebragramTorFetchFailed">Could not fetch bridges</string>
     <string name="BebragramTorFetching">Fetching bridges…</string>
-    <string name="BebragramTorBridgeHintInfo">Leave empty to fetch fresh bridges from torproject.org. Paste your own lines to override.</string>
+    <string name="BebragramTorBridgeHintInfo">Leave empty to use GitHub bridge lists. Paste your own lines to override.</string>
     <!-- bebragram: main menu editor -->
     <string name="BebragramMainMenu">Main menu</string>
     <string name="BebragramMainMenuItems">Menu items</string>

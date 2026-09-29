@@ -46,19 +46,19 @@ object TorConfig {
             store().edit().putInt("tor_bridge_refresh_hours", value).apply()
         }
 
-    /** True while the stored bridge lines were written by us (button / auto-refresh), not pasted by the user. */
-    var bridgesAutoManaged: Boolean
-        get() = store().getBoolean("tor_bridges_auto", false)
-        set(value) {
-            store().edit().putBoolean("tor_bridges_auto", value).apply()
-        }
+    /** Auto-managed state belongs to a transport, so changing modes cannot overwrite pasted lines. */
+    fun autoManagedFor(mode: String): Boolean = store().getBoolean("tor_bridges_auto_$mode", false)
 
-    /** When the bridges were last refreshed. */
-    var lastBridgeRefresh: Long
-        get() = store().getLong("tor_bridges_refreshed_at", 0L)
-        set(value) {
-            store().edit().putLong("tor_bridges_refreshed_at", value).apply()
-        }
+    fun setAutoManagedFor(mode: String, value: Boolean) {
+        store().edit().putBoolean("tor_bridges_auto_$mode", value).apply()
+    }
+
+    fun lastBridgeRefreshFor(mode: String): Long =
+        store().getLong("tor_bridges_refreshed_at_$mode", 0L)
+
+    fun setLastBridgeRefreshFor(mode: String, value: Long) {
+        store().edit().putLong("tor_bridges_refreshed_at_$mode", value).apply()
+    }
 
     /** Manual bridge lines for [mode]. Each transport keeps its own, so switching modes never loses them. */
     fun bridgesFor(mode: String): String = store().getString("tor_bridges_$mode", "") ?: ""
@@ -76,6 +76,13 @@ object TorConfig {
                 setBridgesFor(mode, legacy)
             }
             store.edit().remove("tor_bridges").apply()
+        }
+        if (store.contains("tor_bridges_auto")) {
+            if (store.getBoolean("tor_bridges_auto", false)) {
+                setAutoManagedFor(mode, true)
+                setLastBridgeRefreshFor(mode, store.getLong("tor_bridges_refreshed_at", 0L))
+            }
+            store.edit().remove("tor_bridges_auto").remove("tor_bridges_refreshed_at").apply()
         }
         if (mode !in setOf("webtunnel", "snowflake")) {
             mode = "webtunnel"

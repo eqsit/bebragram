@@ -24,7 +24,7 @@ idea {
 def buildTimestamp = System.getenv('BUILD_TIMESTAMP') ?: '0'
 def commitId = System.getenv('COMMIT_ID')
 def verName = "${APP_VERSION_NAME}${commitId?.take(7) ? "-${commitId.take(7)}" : ''}"
-def verCode = 1261
+def verCode = 1262
 
 def officialVer = APP_VERSION_NAME
 def officialCode = APP_VERSION_CODE
@@ -104,8 +104,8 @@ android {
         versionCode verCode
 
         // obtain your own keys at https://core.telegram.org/api/obtaining_api_id
-        def appId = '6'
-        def appHash = 'eb06d4abfb49dc3eeb1aeb98ae0f581e'
+        def appId = '24432768'
+        def appHash = '081555aafce571f3e4c4b3f9fe653dc1'
 
         if (properties != null) {
             appId = properties.getProperty('TELEGRAM_APP_ID') ?: System.getenv('TELEGRAM_APP_ID') ?: appId

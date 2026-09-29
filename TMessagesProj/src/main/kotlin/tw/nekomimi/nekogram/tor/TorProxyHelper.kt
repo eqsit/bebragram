@@ -8,6 +8,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.ServiceConnection
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
@@ -25,18 +28,34 @@ import java.util.concurrent.TimeUnit
 
 /** Owns the embedded Tor instance. Never enable Telegram's proxy until Tor has a circuit. */
 object TorProxyHelper {
+    @JvmStatic
+    fun isTorProcess(): Boolean = runCatching {
+        File("/proc/self/cmdline").readText().substringBefore('\u0000').endsWith(":bebragram_tor")
+    }.getOrDefault(false)
+
     private val worker = Executors.newSingleThreadExecutor()
     private lateinit var app: Context
     private var generation = 0
     private var bound = false
-    private var service: TorService? = null
+    private var service: TorRemote? = null
+    private var torBinder: IBinder? = null
     private val startedTransports = mutableListOf<String>()
     private var localProxy: SharedConfig.ProxyInfo? = null
     private var previousProxy: SharedConfig.ProxyInfo? = null
     private var previousEnabled = false
     private var previousCallsEnabled = false
     private const val PREVIOUS_PROXY_KEY = "inu_tor_previous_proxy"
-    private const val MAX_PING_CANDIDATES = 24
+    private const val MAX_PING_CANDIDATES = 12
+    private const val SELECTED_BRIDGES = 3
+    private const val HEALTH_CHECK_MS = 90_000L
+    @Volatile private var activeBridgeLines = ""
+    @Volatile private var activeAutoBridges = false
+    private var healthCheckScheduled = false
+    private var missedHealthChecks = 0
+    @Volatile private var defaultNetwork: Network? = null
+    @Volatile private var networkChanged = false
+    private var reconnectWhenOnline = false
+    private var reconnectWhenVpnOff = false
     /** Hosts that failed ping or killed a bootstrap; never picked again this session. */
     private val badBridgeHosts = java.util.Collections.synchronizedSet(mutableSetOf<String>())
     private var rotationAttempts = 0
@@ -68,14 +87,22 @@ object TorProxyHelper {
     }
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-            val tor = (binder as? TorService.LocalBinder)?.service ?: return
+            if (!bound) return
+            val tor = binder?.let { TorRemote(it) } ?: return
+            torBinder = binder
+            try {
+                binder.linkToDeath(torDeath, 0)
+            } catch (e: android.os.RemoteException) {
+                onTorProcessDied()
+                return
+            }
             service = tor
             val token = generation
             worker.execute {
                 var lastPhase = ""
-                for (i in 0 until 450) {
+                for (i in 0 until 300) {
                     if (token != generation) return@execute
-                    if (tor.torControlConnection != null) {
+                    if (tor.controlReady) {
                         val phase = tor.getInfo("status/bootstrap-phase")
                         if (phase != null && phase != lastPhase) {
                             lastPhase = phase
@@ -88,8 +115,13 @@ object TorProxyHelper {
                             TorLog.add("circuit established, tor SOCKS port ${tor.socksPort}")
                             AndroidUtilities.runOnUIThread {
                                 if (token == generation) {
-                                    status = "ON"
-                                    connectProxy(tor.socksPort)
+                                    if (ProxyUtil.isVpnProxySuppressionActive()) {
+                                        pauseForVpn()
+                                    } else {
+                                        status = "ON"
+                                        connectProxy(tor.socksPort)
+                                        scheduleHealthCheck()
+                                    }
                                 }
                             }
                             return@execute
@@ -103,37 +135,110 @@ object TorProxyHelper {
             }
         }
         override fun onServiceDisconnected(name: ComponentName?) {
-            AndroidUtilities.runOnUIThread { if (TorConfig.enabled) fail("Tor service stopped") }
+            AndroidUtilities.runOnUIThread {
+                if (torBinder?.isBinderAlive == false) onTorProcessDied()
+            }
+        }
+    }
+    private val torDeath = IBinder.DeathRecipient {
+        AndroidUtilities.runOnUIThread { onTorProcessDied() }
+    }
+
+    private fun onTorProcessDied() {
+        torBinder = null
+        service = null
+        if (status == "STOPPING") {
+            status = when {
+                reconnectWhenVpnOff -> "WAITING_FOR_VPN"
+                reconnectWhenOnline -> "WAITING_FOR_NETWORK"
+                else -> "OFF"
+            }
+            if (startQueued) {
+                startQueued = false
+                start()
+            } else if (reconnectWhenVpnOff && !ProxyUtil.isVpnProxySuppressionActive() && hasInternet()) {
+                reconnectWhenVpnOff = false
+                start()
+            } else if (reconnectWhenOnline && hasInternet()) {
+                reconnectWhenOnline = false
+                start()
+            }
+        } else if (bound && TorConfig.enabled && (status == "ON" || status == "STARTING")) {
+            fail("Tor process stopped")
         }
     }
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == TorService.ACTION_ERROR) {
-                fail(intent.getStringExtra(Intent.EXTRA_TEXT) ?: "Tor error")
+                if (status != "STOPPING" && TorConfig.enabled) {
+                    fail(intent.getStringExtra(Intent.EXTRA_TEXT) ?: "Tor error")
+                }
                 return
             }
             val state = intent?.getStringExtra(TorService.EXTRA_STATUS) ?: return
-            val wasStopping = status == "STOPPING"
-            status = state
             TorLog.add("tor status: $state")
-            if (state == "ON") {
-                service?.socksPort?.takeIf { it in 1..65535 }?.let { connectProxy(it) }
-            } else if (state == "OFF") {
-                if (startQueued) {
-                    startQueued = false
-                    start()
-                } else if (!wasStopping && TorConfig.enabled) {
-                    fail("Tor stopped before connecting")
-                }
+            // The broadcast can arrive before process death (or late from an old process).
+            // Bootstrap and the Binder death recipient own state transitions.
+        }
+    }
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            val previous = defaultNetwork
+            defaultNetwork = network
+            if (previous != network) networkChanged = true
+            scheduleNetworkAction(network)
+        }
+
+        override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+            if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+                scheduleNetworkAction(network)
             }
         }
+
+        override fun onLost(network: Network) {
+            if (defaultNetwork == network) defaultNetwork = null
+        }
+    }
+
+    private fun hasInternet(): Boolean {
+        val connectivity = app.getSystemService(ConnectivityManager::class.java) ?: return false
+        val network = connectivity.activeNetwork ?: return false
+        return connectivity.getNetworkCapabilities(network)
+            ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+    }
+
+    private fun scheduleNetworkAction(network: Network) {
+        if (!networkChanged && !reconnectWhenOnline && !reconnectWhenVpnOff) return
+        AndroidUtilities.runOnUIThread({
+            if (defaultNetwork != network || !hasInternet()) return@runOnUIThread
+            val wasVpnPaused = reconnectWhenVpnOff
+            onVpnPreferenceChanged()
+            if (ProxyUtil.isVpnProxySuppressionActive() || wasVpnPaused) {
+                networkChanged = false
+                return@runOnUIThread
+            }
+            if (reconnectWhenOnline) {
+                reconnectWhenOnline = false
+                networkChanged = false
+                TorLog.add("internet restored; starting Tor")
+                start()
+            } else if (networkChanged && TorConfig.enabled &&
+                (status == "ON" || status == "STARTING")) {
+                networkChanged = false
+                TorLog.add("default network changed; restarting Tor")
+                restartForNewBridges()
+            } else {
+                networkChanged = false
+            }
+        }, 3000)
     }
 
     @JvmStatic
     fun init(context: Context) {
+        if (isTorProcess()) return
         app = context.applicationContext
         TorConfig.migrateLegacy()
-        prefetchBridges()
+        if (!(TorConfig.enabled && TorConfig.autostart)) prefetchBridges()
         AndroidUtilities.runOnUIThread(autoRefreshTick, 5000)
         try {
             SharedConfig.loadProxyList()
@@ -145,6 +250,12 @@ object TorProxyHelper {
         val filter = IntentFilter(TorService.ACTION_STATUS).apply { addAction(TorService.ACTION_ERROR) }
         if (Build.VERSION.SDK_INT >= 33) app.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
         else @Suppress("DEPRECATION") app.registerReceiver(receiver, filter)
+        if (Build.VERSION.SDK_INT >= 24) {
+            val connectivity = app.getSystemService(ConnectivityManager::class.java)
+            defaultNetwork = connectivity?.activeNetwork
+            runCatching { connectivity?.registerDefaultNetworkCallback(networkCallback) }
+                .onFailure { TorLog.add("network callback unavailable: ${it.javaClass.simpleName}") }
+        }
         if (TorConfig.enabled && TorConfig.autostart) start() // opt-in only
         else if (TorConfig.enabled) {
             TorConfig.enabled = false
@@ -154,31 +265,46 @@ object TorProxyHelper {
 
     fun start() {
         if (!::app.isInitialized) return
+        if (torBinder != null && status != "ON" && status != "STARTING") {
+            startQueued = true
+            TorConfig.enabled = true
+            status = "STOPPING"
+            return
+        }
         if (status.startsWith("ERROR:")) status = "OFF"
+        if (status == "WAITING_FOR_NETWORK") status = "OFF"
+        if (status == "WAITING_FOR_VPN") status = "OFF"
         if (status == "STOPPING") {
             // TorService must be destroyed before a new torrc is written, otherwise the old instance keeps running.
             startQueued = true
             TorConfig.enabled = true
-            val token = generation
-            worker.execute {
-                TimeUnit.SECONDS.sleep(12)
-                AndroidUtilities.runOnUIThread {
-                    // no OFF broadcast arrived; assume the old instance is gone rather than wedging the toggle
-                    if (startQueued && token == generation) {
-                        startQueued = false
-                        status = "OFF"
-                        start()
-                    }
-                }
-            }
             return
         }
         if (status != "OFF") return
+        if (ProxyUtil.isVpnProxySuppressionActive()) {
+            TorConfig.enabled = true
+            reconnectWhenVpnOff = true
+            status = "WAITING_FOR_VPN"
+            TorLog.add("waiting for VPN to disconnect before starting Tor")
+            return
+        }
+        if (!hasInternet()) {
+            TorConfig.enabled = true
+            reconnectWhenOnline = true
+            status = "WAITING_FOR_NETWORK"
+            TorLog.add("waiting for internet before starting Tor")
+            return
+        }
+        reconnectWhenOnline = false
+        reconnectWhenVpnOff = false
         TorConfig.enabled = true
         val token = ++generation
         status = "STARTING"
         progress = -1
         lastError = null
+        AndroidUtilities.runOnUIThread({
+            if (token == generation && status == "STARTING") fail("Tor connection timed out")
+        }, 45_000)
         worker.execute {
             try {
                 val mode = TorConfig.mode
@@ -214,11 +340,11 @@ object TorProxyHelper {
                     .joinToString("\n", postfix = "\n")
                 if (token != generation) return@execute
                 TorService.getTorrc(app).writeText(torrc)
-                TorLog.add("torrc written:\n$torrc")
+                TorLog.add("torrc written (${countBridges(bridges)} bridge line(s))")
                 AndroidUtilities.runOnUIThread {
                     if (token != generation) return@runOnUIThread
                     bound = try {
-                        app.bindService(Intent(app, TorService::class.java), connection, Context.BIND_AUTO_CREATE)
+                        app.bindService(Intent(app, TorHostService::class.java), connection, Context.BIND_AUTO_CREATE)
                     } catch (e: Exception) {
                         TorLog.add("bindService threw: ${e.message}")
                         false
@@ -236,7 +362,13 @@ object TorProxyHelper {
     fun stop() {
         TorLog.add("stop requested (status=$status)")
         TorConfig.enabled = false
+        reconnectWhenOnline = false
+        reconnectWhenVpnOff = false
         ++generation
+        startQueued = false
+        healthCheckScheduled = false
+        missedHealthChecks = 0
+        AndroidUtilities.cancelRunOnUIThread(healthTick)
         restoreProxy()
         stoppedForOtherProxy = false
         val wasBound = bound
@@ -244,27 +376,96 @@ object TorProxyHelper {
         service = null
         status = if (wasBound) "STOPPING" else "OFF"
         progress = -1
+        if (wasBound) {
+            val token = generation
+            // Binder death confirms that the old native Tor instance is gone.
+            AndroidUtilities.runOnUIThread({
+                if (token == generation && status == "STOPPING" && !bound) {
+                    if (torBinder == null) {
+                        status = "OFF"
+                        if (startQueued) { startQueued = false; start() }
+                    } else {
+                        lastError = "Tor process did not stop"
+                        status = "ERROR: ${lastError}"
+                        TorConfig.enabled = false
+                        startQueued = false
+                    }
+                }
+            }, 5_000)
+        }
         worker.execute {
             startedTransports.forEach { name -> try { controller.stop(name) } catch (e: Exception) { TorLog.add("stop $name: ${e.message}") } }
             startedTransports.clear()
         }
     }
 
+    /** The VPN setting pauses native Tor too, so an unused circuit does not drain the battery. */
+    @JvmStatic
+    fun onVpnPreferenceChanged() {
+        if (!::app.isInitialized) return
+        if (ProxyUtil.isVpnProxySuppressionActive()) {
+            if (TorConfig.enabled && (status == "ON" || status == "STARTING")) pauseForVpn()
+        } else if (reconnectWhenVpnOff && status != "STOPPING") {
+            reconnectWhenVpnOff = false
+            start()
+        }
+    }
+
+    private fun pauseForVpn() {
+        TorLog.add("VPN active; pausing Tor")
+        stop()
+        TorConfig.enabled = true
+        reconnectWhenVpnOff = true
+        if (status == "OFF") status = "WAITING_FOR_VPN"
+    }
+
     private fun fail(reason: String) {
         TorLog.add("FAIL: $reason")
+        val offline = !hasInternet()
         lastError = reason
         status = "ERROR: $reason"
         stop()
-        status = "ERROR: $reason"
-        maybeRotateBridges(reason)
+        if (offline) {
+            TorConfig.enabled = true
+            reconnectWhenOnline = true
+            if (status != "STOPPING") status = "WAITING_FOR_NETWORK"
+        } else {
+            status = "ERROR: $reason"
+            maybeRotateBridges(reason)
+        }
+    }
+
+    /** Tor can lose its circuit after bootstrap. Poll only while enabled and let Tor retry first. */
+    private val healthTick = object : Runnable {
+        override fun run() {
+            healthCheckScheduled = false
+            if (status != "ON" || !TorConfig.enabled) return
+            val token = generation
+            val tor = service ?: return
+            worker.execute {
+                val established = runCatching { tor.getInfo("status/circuit-established") == "1" }.getOrDefault(false)
+                AndroidUtilities.runOnUIThread {
+                    if (token != generation || status != "ON") return@runOnUIThread
+                    missedHealthChecks = if (established) 0 else missedHealthChecks + 1
+                    if (missedHealthChecks >= 3) fail("Tor circuit lost")
+                    else scheduleHealthCheck()
+                }
+            }
+        }
+    }
+
+    private fun scheduleHealthCheck() {
+        if (healthCheckScheduled || status != "ON") return
+        healthCheckScheduled = true
+        AndroidUtilities.runOnUIThread(healthTick, HEALTH_CHECK_MS)
     }
 
     /** A dead bridge must not kill the connection: remember it, fetch fresh ones and retry. */
     private fun maybeRotateBridges(reason: String) {
-        if (rotationAttempts >= 2 || !TorConfig.bridgesAutoManaged) return
+        if (rotationAttempts >= 2 || !activeAutoBridges) return
         val mode = TorConfig.mode
         if (mode == "direct" || mode == "custom") return
-        val lines = TorConfig.bridgesFor(mode)
+        val lines = activeBridgeLines
         if (lines.isBlank()) return
         var added = false
         lines.lineSequence().forEach { line ->
@@ -274,8 +475,10 @@ object TorProxyHelper {
         if (!added && badBridgeHosts.isNotEmpty()) return
         rotationAttempts++
         TorLog.add("bridges: rotating after \"$reason\" (bad hosts: ${badBridgeHosts.size})")
-        TorConfig.enabled = true
-        refreshBridges()
+        val token = generation
+        refreshBridges { count ->
+            if (count > 0 && token == generation && mode == TorConfig.mode && !TorConfig.enabled) start()
+        }
     }
 
     @JvmStatic fun isTorProxy(proxy: SharedConfig.ProxyInfo): Boolean = proxy == localProxy
@@ -423,13 +626,21 @@ object TorProxyHelper {
             callback?.accept(-1)
             return
         }
+        if (!hasInternet()) {
+            callback?.accept(-1)
+            return
+        }
         worker.execute {
             val fresh = try {
                 githubBridges(mode)
             } catch (e: Exception) {
                 null
             }
-            val lines = fresh ?: runCatching { bundledBridges(mode) }.getOrNull()
+            val lines = fresh ?: runCatching {
+                rankByPing(bundledBridges(mode).lines().filter { line ->
+                    pingTarget(line)?.first !in badBridgeHosts
+                }.take(MAX_PING_CANDIDATES), SELECTED_BRIDGES).joinToString("\n")
+            }.getOrNull()
             if (lines.isNullOrBlank()) {
                 TorLog.add("bridge refresh failed: no $mode bridges")
                 AndroidUtilities.runOnUIThread { callback?.accept(-1) }
@@ -438,12 +649,12 @@ object TorProxyHelper {
             val count = countBridges(lines)
             cacheBridges(mode, lines)
             TorConfig.setBridgesFor(mode, lines)
-            TorConfig.bridgesAutoManaged = true
-            TorConfig.lastBridgeRefresh = System.currentTimeMillis()
+            TorConfig.setAutoManagedFor(mode, true)
+            TorConfig.setLastBridgeRefreshFor(mode, System.currentTimeMillis())
             TorLog.add("bridges: refreshed $count $mode line(s)")
             AndroidUtilities.runOnUIThread {
                 callback?.accept(count)
-                if (TorConfig.enabled) restartForNewBridges()
+                if (TorConfig.enabled && TorConfig.mode == mode) restartForNewBridges()
             }
         }
     }
@@ -463,8 +674,9 @@ object TorProxyHelper {
 
     private fun maybeAutoRefresh() {
         val hours = TorConfig.bridgeAutoRefreshHours
-        if (hours <= 0 || !TorConfig.bridgesAutoManaged) return
-        val due = System.currentTimeMillis() - TorConfig.lastBridgeRefresh >= hours * 3600_000L
+        val mode = TorConfig.mode
+        if (hours <= 0 || !TorConfig.autoManagedFor(mode) || !hasInternet()) return
+        val due = System.currentTimeMillis() - TorConfig.lastBridgeRefreshFor(mode) >= hours * 3600_000L
         if (due) {
             TorLog.add("auto-refresh: bridges are older than $hours h")
             refreshBridges()
@@ -475,6 +687,7 @@ object TorProxyHelper {
     @JvmStatic
     fun prefetchBridges() {
         if (!::app.isInitialized) return
+        if (TorConfig.enabled) return
         val mode = TorConfig.mode
         if (mode == "direct" || mode == "custom") return
         if (TorConfig.bridgesFor(mode).isNotBlank()) return
@@ -493,23 +706,33 @@ object TorProxyHelper {
 
     /** Resolve bridge lines for [mode]: manual input, then fresh GitHub lists, then bundled. */
     fun bridgeLines(mode: String): String {
+        activeAutoBridges = false
+        activeBridgeLines = ""
         if (mode == "direct") return ""
         val manual = TorConfig.bridgesFor(mode)
         if (manual.isNotBlank()) {
+            activeBridgeLines = manual
+            activeAutoBridges = TorConfig.autoManagedFor(mode)
             TorLog.add("bridges: using ${countBridges(manual)} line(s) from settings")
             return manual
         }
         if (mode == "custom") throw IllegalArgumentException("Paste bridge lines for custom mode")
         cachedBridges(mode)?.let {
+            activeBridgeLines = it
+            activeAutoBridges = true
             TorLog.add("bridges: ${countBridges(it)} cached $mode line(s)")
             return it
         }
         githubBridges(mode)?.let {
+            activeBridgeLines = it
+            activeAutoBridges = true
             TorLog.add("bridges: fetched ${countBridges(it)} $mode line(s) from github")
             cacheBridges(mode, it)
             return it
         }
         val bundled = bundledBridges(mode)
+        activeBridgeLines = bundled
+        activeAutoBridges = true
         TorLog.add("bridges: ${countBridges(bundled)} bundled $mode line(s)")
         return bundled
     }
@@ -530,7 +753,7 @@ object TorProxyHelper {
         val split = raw.indexOf('|')
         if (split <= 0) return null
         val age = System.currentTimeMillis() - (raw.substring(0, split).toLongOrNull() ?: return null)
-        if (age > BRIDGE_CACHE_TTL_MS) return null
+        if (age < 0 || age > BRIDGE_CACHE_TTL_MS) return null
         return raw.substring(split + 1).takeIf { it.isNotBlank() }
     }
 
@@ -549,9 +772,8 @@ object TorProxyHelper {
     )
 
     /**
-     * Machine-verified bridge lists from GitHub: the 72h file plus the full list are merged
-     * into one candidate pool, every candidate is ping-tested and only alive ones are used
-     * (the fastest first). Dead hosts are remembered and never picked again this session.
+     * Sample up to 12 distinct endpoints from GitHub lists and keep three responsive ones.
+     * This is only an endpoint check; Tor bootstrap is the actual bridge check.
      */
     private fun githubBridges(mode: String): String? {
         val files = when (mode) {
@@ -560,24 +782,25 @@ object TorProxyHelper {
             "obfs4" -> listOf("bridge/obfs4_72h.txt", "bridge/obfs4_tested.txt")
             else -> return null
         }
-        val limit = 2
         for (base in githubSources) {
-            val pool = LinkedHashSet<String>()
+            val pool = LinkedHashMap<Pair<String, Int>, String>()
             for (file in files) {
-                val text = httpGet(base + file, mode) ?: continue
+                val text = httpGet(base + file) ?: continue
                 text.lineSequence()
                     .map { it.trim() }
                     .filter { it.isNotEmpty() && !it.startsWith("#") }
                     .map { if (it.startsWith("Bridge ")) it.substring(7).trim() else it }
                     .filter { it.startsWith("$mode ") }
                     .forEach { line ->
-                        val host = pingTarget(line)?.first
-                        if (host == null || host !in badBridgeHosts) pool.add(line)
+                        val endpoint = pingTarget(line)
+                        if (endpoint != null && endpoint.first !in badBridgeHosts && pool.size < MAX_PING_CANDIDATES) {
+                            pool.putIfAbsent(endpoint, line)
+                        }
                     }
                 if (pool.size >= MAX_PING_CANDIDATES) break
             }
             if (pool.isEmpty()) continue
-            val ranked = rankByPing(pool.take(MAX_PING_CANDIDATES), limit)
+            val ranked = rankByPing(pool.values.toList(), SELECTED_BRIDGES)
             if (ranked.isNotEmpty()) {
                 TorLog.add("bridges: github ${pool.size} candidates, ${ranked.size} alive selected for $mode")
                 return ranked.joinToString("\n")
@@ -588,7 +811,7 @@ object TorProxyHelper {
     }
 
     /** TCP-connect time to the endpoint that actually matters for this bridge line. */
-    private fun pingHost(host: String, port: Int, timeoutMs: Int = 2000): Long {
+    private fun pingHost(host: String, port: Int, timeoutMs: Int = 1500): Long {
         val start = System.currentTimeMillis()
         return try {
             java.net.Socket().use { socket ->
@@ -628,15 +851,15 @@ object TorProxyHelper {
         val url = valueOf(line, "url").ifEmpty { valueOf(line, "ampcache") }
         val start = System.currentTimeMillis()
         if (url.isEmpty()) {
-            val t = pingHost(target.first, target.second, 2000)
+            val t = pingHost(target.first, target.second)
             return if (t == Long.MAX_VALUE) null else t
         }
         var connection: java.net.HttpURLConnection? = null
         return try {
             connection = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
                 requestMethod = "GET"
-                connectTimeout = 2500
-                readTimeout = 3000
+                connectTimeout = 1800
+                readTimeout = 1800
                 instanceFollowRedirects = false
                 setRequestProperty("User-Agent", "Bebragram")
             }
@@ -659,7 +882,7 @@ object TorProxyHelper {
                     line to checkEndpoint(line)
                 })
             }
-                .mapNotNull { runCatching { it.get(6, java.util.concurrent.TimeUnit.SECONDS) }.getOrNull() }
+                .mapNotNull { runCatching { it.get(4, java.util.concurrent.TimeUnit.SECONDS) }.getOrNull() }
                 .filter { it.second != null }
                 .sortedBy { it.second }
                 .map { it.first }
@@ -671,14 +894,14 @@ object TorProxyHelper {
         }
     }
 
-    private fun httpGet(url: String, mode: String): String? {
+    private fun httpGet(url: String): String? {
         var connection: java.net.HttpURLConnection? = null
         TorLog.add("bridge fetch: github $url")
         return try {
             connection = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
                 requestMethod = "GET"
-                connectTimeout = 4000
-                readTimeout = 8000
+                connectTimeout = 3000
+                readTimeout = 5000
                 setRequestProperty("User-Agent", "Bebragram")
             }
             if (connection.responseCode != 200) {
@@ -686,7 +909,17 @@ object TorProxyHelper {
                 android.util.Log.d("BebragramTor", "github HTTP ${connection.responseCode}: $url")
                 return null
             }
-            connection.inputStream.bufferedReader().use { it.readText() }
+            connection.inputStream.bufferedReader().use { reader ->
+                val buffer = CharArray(8192)
+                val result = StringBuilder()
+                while (result.length <= 1_000_000) {
+                    val count = reader.read(buffer)
+                    if (count < 0) return@use result.toString()
+                    result.append(buffer, 0, count)
+                }
+                TorLog.add("bridge fetch: list too large")
+                null
+            }
         } catch (e: Exception) {
             TorLog.add("bridge fetch: github failed (${e.javaClass.simpleName})")
             android.util.Log.d("BebragramTor", "github failed: ${e.javaClass.simpleName} ${e.message} $url")
