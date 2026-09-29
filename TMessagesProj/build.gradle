@@ -24,7 +24,7 @@ idea {
 def buildTimestamp = System.getenv('BUILD_TIMESTAMP') ?: '0'
 def commitId = System.getenv('COMMIT_ID')
 def verName = "${APP_VERSION_NAME}${commitId?.take(7) ? "-${commitId.take(7)}" : ''}"
-def verCode = 1262
+def verCode = 1263
 
 def officialVer = APP_VERSION_NAME
 def officialCode = APP_VERSION_CODE
@@ -220,6 +220,17 @@ configurations.configureEach {
     exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk8'
 }
 
+// Build IPtProxy with Lyrebird's uTLS replacement applied at the root Go module.
+// A replace directive in a dependency's go.mod is ignored by Go.
+def torTransportAar = layout.buildDirectory.file('tor-transport/IPtProxy.aar')
+def buildTorTransport = tasks.register('buildTorTransport', Exec) {
+    inputs.dir(rootProject.file('Tools/tor-transport'))
+    outputs.file(torTransportAar)
+    commandLine 'bash', rootProject.file('Tools/tor-transport/build.sh').absolutePath,
+        torTransportAar.get().asFile.absolutePath
+    environment 'ANDROID_HOME', androidComponents.sdkComponents.sdkDirectory.get().asFile.absolutePath
+}
+
 dependencies {
     // official
     implementation 'androidx.core:core-ktx:1.19.0'
@@ -230,7 +241,7 @@ dependencies {
     implementation 'com.google.zxing:core:3.5.4'
     // bebragram: embedded Tor
     implementation 'info.guardianproject:tor-android:0.4.9.6'
-    implementation 'com.netzarchitekten:IPtProxy:5.5.1'
+    implementation files(torTransportAar).builtBy(buildTorTransport)
     implementation 'androidx.sharetarget:sharetarget:1.2.0'
     implementation 'androidx.interpolator:interpolator:1.0.0'
     implementation 'androidx.biometric:biometric:1.1.0'

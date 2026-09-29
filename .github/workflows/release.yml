@@ -33,12 +33,20 @@ jobs:
         with:
           distribution: 'temurin'
           java-version: '21'
+      - name: Set up Go for Tor transports
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.4'
+          cache-dependency-path: Tools/tor-transport/IPtProxy.go/go.sum
+      - name: Test WebTunnel TLS
+        working-directory: Tools/tor-transport/IPtProxy.go
+        run: go test -v ./...
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
       - name: Set up Android SDK Tools
         uses: android-actions/setup-android@v4
         with:
-          packages: "build-tools;36.0.0 ndk;27.2.12479018 platforms;android-37.0"
+          packages: "build-tools;36.0.0 ndk;27.2.12479018 ndk;28.2.13676358 platforms;android-37.0"
       - name: Install Native Build Dependencies
         run: |
           sudo apt-get update

@@ -22,7 +22,7 @@ object TorConfig {
         }
 
     var autostart: Boolean
-        get() = store().getBoolean("tor_autostart", false)
+        get() = store().getBoolean("tor_autostart", true)
         set(value) {
             store().edit().putBoolean("tor_autostart", value).apply()
         }

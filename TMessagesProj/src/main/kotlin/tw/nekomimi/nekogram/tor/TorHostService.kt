@@ -27,8 +27,16 @@ class TorHostService : TorService() {
     override fun onBind(intent: Intent?): IBinder = remoteBinder
 
     override fun onDestroy() {
-        super.onDestroy()
-        // Keep the native Tor globals out of the next session, even if Android caches the service process.
-        Process.killProcess(Process.myPid())
+        // TorService's synchronous control-port shutdown can itself block. The parent
+        // waits for Binder death, so guarantee that this dedicated process exits.
+        Thread({
+            Thread.sleep(2_000)
+            Process.killProcess(Process.myPid())
+        }, "TorExitWatchdog").apply { isDaemon = true }.start()
+        try {
+            super.onDestroy()
+        } finally {
+            Process.killProcess(Process.myPid())
+        }
     }
 }
