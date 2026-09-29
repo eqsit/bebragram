@@ -12,8 +12,10 @@ Pinned sources:
 - uTLS replacement: gitlab.torproject.org/shelikhoo/utls-temporary v0.0.0-20260114141111-0f042ad603ef
 - Go: 1.26.4; gomobile/gobind: v0.0.0-20260611195102-4dd8f1dbf5d2
 
-IPtProxy and DNSTT sources are copied unchanged. The root module's uTLS replacement,
-checksums and TLS regression test are the local changes. Licenses are included.
+IPtProxy sources are copied unchanged. DNSTT fixes a reversed `errors.As` call in
+the SOCKS accept loop so temporary network errors are detected correctly. The root
+module also adds the uTLS replacement, checksums and TLS regression test. Licenses
+are included.
 
 The Gradle `buildTorTransport` task builds all four Android ABIs automatically;
 CI installs Go and NDK 28.2.13676358. Local prerequisites: Go, JDK 21, Android SDK
@@ -23,6 +25,8 @@ The output AAR lives in `TMessagesProj/build/tor-transport`.
 ```sh
 cd Tools/tor-transport/IPtProxy.go
 go test -v ./...
+cd ../dnstt
+go test ./...
 ```
 
 The regression uses a local TLS server with ML-KEM enabled and 128 deterministic

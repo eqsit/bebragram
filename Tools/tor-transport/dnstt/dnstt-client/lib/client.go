@@ -129,7 +129,7 @@ func AcceptLoop(ln *pt.SocksListener, utlsClientHelloID *utls.ClientHelloID, shu
 		if err != nil {
 			//goland:noinspection GoDeprecation
 			var netErr net.Error
-			if errors.As(netErr, &err) && netErr.Temporary() {
+			if errors.As(err, &netErr) && netErr.Temporary() {
 				continue
 			}
 

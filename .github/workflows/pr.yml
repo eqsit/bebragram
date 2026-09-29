@@ -32,6 +32,9 @@ jobs:
       - name: Test WebTunnel TLS
         working-directory: Tools/tor-transport/IPtProxy.go
         run: go test -v ./...
+      - name: Test DNSTT
+        working-directory: Tools/tor-transport/dnstt
+        run: go test ./...
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
       - name: Set up Android SDK Tools
