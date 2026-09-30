@@ -1,8 +1,8 @@
 package android.net
 class Network
 class NetworkCapabilities {
-    companion object { const val NET_CAPABILITY_VALIDATED=1 }
-    fun hasCapability(capability: Int) = true
+    companion object { const val NET_CAPABILITY_VALIDATED=1; const val NET_CAPABILITY_INTERNET=2 }
+    fun hasCapability(capability: Int) = capability == NET_CAPABILITY_INTERNET
 }
 class ConnectivityManager {
     companion object { var network = Network(); var callback: NetworkCallback? = null }

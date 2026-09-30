@@ -16,6 +16,9 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLStreamHandler
 
+@Volatile private var fetchGate: java.util.concurrent.CountDownLatch? = null
+private val sourceRequests = java.util.concurrent.atomic.AtomicInteger()
+
 private fun mockBridgeRequests() {
     URL.setURLStreamHandlerFactory { protocol ->
         if (protocol != "https") null else object : URLStreamHandler() {
@@ -23,9 +26,15 @@ private fun mockBridgeRequests() {
                 override fun connect() {}
                 override fun disconnect() {}
                 override fun usingProxy() = false
-                override fun getResponseCode() = 200
+                override fun getResponseCode(): Int {
+                    if (url.host == "cdn.jsdelivr.net" || url.host == "raw.githubusercontent.com") {
+                        sourceRequests.incrementAndGet()
+                        fetchGate?.await()
+                    }
+                    return 200
+                }
                 override fun getInputStream() =
-                    "webtunnel 192.0.2.9:443 cert=dummy url=https://bridge.example.test/path".byteInputStream()
+                    "webtunnel 192.0.2.9:443 url=https://bridge.example.test/path".byteInputStream()
             }
         }
     }
@@ -76,14 +85,17 @@ fun awaitCondition(description: String, condition: () -> Boolean) {
 }
 fun main() {
     try {
+        testBridgeValidationAndBudgets()
         mockBridgeRequests()
         val app = Context()
         ApplicationLoader.applicationContext = app
         check(TorConfig.autostart) { "Autostart must default to true" }
         TorConfig.autostart = false
         check(!TorConfig.autostart) { "Explicit opt-out must survive" }
-        TorConfig.setBridgesFor("webtunnel", "webtunnel 192.0.2.1:443 cert=dummy url=https://example.invalid/")
+        TorConfig.setBridgesFor("webtunnel", "webtunnel 192.0.2.1:443 url=https://example.invalid/")
+        TorConfig.mode = "snowflake"
         TorProxyHelper.init(app)
+        check(TorConfig.mode == "webtunnel") { "Retired Snowflake preference was not migrated" }
         TorConfig.mode = "direct"
         TorProxyHelper.start()
         awaitCondition("initial binding") { app.bindings.size == 1 }
@@ -160,7 +172,39 @@ fun main() {
         lastBinder.die()
         awaitCondition("final stop") { TorProxyHelper.status == "OFF" }
 
-        val knownBridge = "webtunnel 192.0.2.10:443 cert=dummy url=https://known.example.test/path"
+        TorConfig.mode = "webtunnel"
+        val gate = java.util.concurrent.CountDownLatch(1)
+        fetchGate = gate
+        val requestCount = sourceRequests.get()
+        var firstRefresh: Int? = null
+        var secondRefresh: Int? = null
+        TorProxyHelper.refreshBridges { firstRefresh = it }
+        TorProxyHelper.refreshBridges { secondRefresh = it }
+        awaitCondition("coalesced source requests") { sourceRequests.get() >= requestCount + 2 }
+        gate.countDown()
+        fetchGate = null
+        awaitCondition("both refresh callbacks") { firstRefresh != null && secondRefresh != null }
+        check(firstRefresh == 1 && secondRefresh == 1)
+        check(sourceRequests.get() == requestCount + 2) { "Duplicate refresh downloaded the lists twice" }
+        println("PASS: repeated refresh shares one fetch and completes both callbacks")
+
+        fetchGate = java.util.concurrent.CountDownLatch(1)
+        val cancelCount = sourceRequests.get()
+        val originalLines = TorConfig.bridgesFor("webtunnel")
+        var cancelledRefresh: Int? = null
+        TorProxyHelper.refreshBridges { cancelledRefresh = it }
+        awaitCondition("fetch before stop") { sourceRequests.get() >= cancelCount + 2 }
+        TorProxyHelper.stop()
+        TorConfig.setBridgesFor("webtunnel", "webtunnel 192.0.2.5:443 url=https://manual.example/path")
+        awaitCondition("cancelled refresh callback without waiting for network") { cancelledRefresh != null }
+        fetchGate!!.countDown()
+        fetchGate = null
+        check(cancelledRefresh == -1 && TorProxyHelper.status == "OFF")
+        check(TorConfig.bridgesFor("webtunnel").contains("manual.example"))
+        TorConfig.setBridgesFor("webtunnel", originalLines)
+        println("PASS: stopped download cannot overwrite manual bridges or restart Tor")
+
+        val knownBridge = "webtunnel 192.0.2.10:443 url=https://known.example.test/path"
         TorConfig.mode = "webtunnel"
         TorConfig.setBridgesFor("webtunnel", knownBridge)
         TorConfig.setAutoManagedFor("webtunnel", true)
@@ -214,6 +258,7 @@ fun main() {
         println("PASS: manual refresh retries STARTING with fresh bridges after old process death")
 
         TorConfig.setAutoManagedFor("webtunnel", true)
+        TorConfig.setBridgesFor("webtunnel", knownBridge)
         bindings = app.bindings.size
         TorProxyHelper.start()
         awaitCondition("stall scenario binding") { app.bindings.size == bindings + 1 }
@@ -223,10 +268,25 @@ fun main() {
         AndroidUtilities.advance(45_001)
         awaitCondition("stalled bootstrap stopped early") { TorProxyHelper.status == "STOPPING" }
         check(TorProxyHelper.lastError == "Tor bootstrap stalled at 25%")
+        awaitCondition("stalled bridge replaced") { TorConfig.bridgesFor("webtunnel") != knownBridge }
+        check(!TorConfig.bridgesFor("webtunnel").contains("known.example.test"))
         TorProxyHelper.stop()
         stalledBinder.die()
         awaitCondition("stalled session stopped") { TorProxyHelper.status == "OFF" }
         println("PASS: stalled automatic bridges retry after 45 seconds without progress")
+        TorConfig.mode = "direct"
+        bindings = app.bindings.size
+        TorProxyHelper.start()
+        awaitCondition("null binding scenario") { app.bindings.size == bindings + 1 }
+        app.bindings.last().onNullBinding(null)
+        check(TorProxyHelper.status.startsWith("ERROR:")) { "Null binding left Tor waiting forever" }
+        TorProxyHelper.stop()
+        TorProxyHelper.start()
+        awaitCondition("stop before null binding") { app.bindings.size == bindings + 2 }
+        TorProxyHelper.stop()
+        app.bindings.last().onNullBinding(null)
+        check(TorProxyHelper.status == "OFF") { "Null binding left Tor stuck in STOPPING" }
+        println("PASS: null service binding releases STARTING and STOPPING")
         println("All Tor lifecycle regression scenarios passed")
         kotlin.system.exitProcess(0)
     } catch(t: Throwable) {

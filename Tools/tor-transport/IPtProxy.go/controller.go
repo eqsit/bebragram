@@ -1,61 +1,6 @@
 package IPtProxy
 
-/**
-Package IPtProxy combines tor pluggable transport clients into a single library for use
-with mobile applications. Transports, when started, will listen for incoming SOCKS
-connections on an available local address and proxy traffic between those connections
-and a configured bridge.
-
-Sample gomobile usage:
-
-```java
-	import IPtProxy.Controller;
-
-	// Create a new Controller instance with provided state directory
-	Controller ptController = Controller.newController("/path/to/statedir", true, false, "DEBUG");
-
-	// Start listening for obfs4 and meek connections, using an outgoing proxy
-	ptController.start(IPtProxy.Obfs4, "socks5://localhost:8001");
-	ptController.start(IPtProxy.MeekLite, "socks5://localhost:8001");
-
-	// Get the address that is listening for SOCKS connections for each transport
-	String obfs4Addr = ptController.localAddress(IPtProxy.Obfs4);
-	String meekAddr = ptController.localAddress(IPtProxy.MeekLite);
-
-	// Start listening for snowflake connections
-	// Note that snowflake setup can happen either here or with SOCKS arguments on
-	// a per-connection basis.
-	ptController.setSnowflakeIceServers("stun:stun.l.google.com:19302,stun:stun.l.google.com:5349");
-	ptController.start(IPtProxy.Snowflake, "");
-
-	// Stop transports
-	ptController.stop(IPtProxy.Snowflake);
-	ptController.stop(IPtProxy.Obfs4);
-	ptController.stop(IPtProxy.MeekLite);
-```
-
-Sample pure go usage:
-
-```go
-	import github.com/tladesignz/IPtProxy
-
-	func main() {
-		ptController := NewController("/path/to/statedir", true, false, "DEBUG")
-
-		ptController.Start(Snowflake)
-		ptController.Start(MeekLite)
-		ptController.Start(Obfs4)
-		addr := ptController.LocalAddress(Snowflake)
-		fmt.Printf("Listening for snowflake connections on: %s", addr)
-
-		// ...
-
-		ptController.Stop(Snowflake)
-		ptController.Stop(Obfs4)
-		ptController.Stop(MeekLite)
-	}
-```
-*/
+// Embedded WebTunnel transport for Bebragram, derived from IPtProxy.
 
 import (
 	"errors"
@@ -67,49 +12,21 @@ import (
 	"os"
 	"path"
 
+	"context"
 	"fmt"
-	"strconv"
-	"sync"
+	"time"
 
 	pt "gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/goptlib"
 	ptlog "gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/common/log"
-	"gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/transports"
 	"gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/transports/base"
-	"gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/v2/common/event"
-	sfversion "gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/snowflake/v2/common/version"
+	"gitlab.torproject.org/tpo/anti-censorship/pluggable-transports/lyrebird/transports/webtunnel"
 	"golang.org/x/net/proxy"
-	dnsttclient "www.bamsoftware.com/git/dnstt.git/dnstt-client/lib"
 )
 
 // LogFileName - the filename of the log residing in `StateDir`.
 const LogFileName = "ipt.log"
 
-//goland:noinspection GoUnusedConst
-const (
-	// ScrambleSuit - DEPRECATED transport implemented in Lyrebird.
-	ScrambleSuit = "scramblesuit"
-
-	// Obfs2 - DEPRECATED transport implemented in Lyrebird.
-	Obfs2 = "obfs2"
-
-	// Obfs3 - DEPRECATED transport implemented in Lyrebird.
-	Obfs3 = "obfs3"
-
-	// Obfs4 - Transport implemented in Lyrebird.
-	Obfs4 = "obfs4"
-
-	// MeekLite - Transport implemented in Lyrebird.
-	MeekLite = "meek_lite"
-
-	// Webtunnel - Transport implemented in Lyrebird.
-	Webtunnel = "webtunnel"
-
-	// Snowflake - Transport implemented in Snowflake.
-	Snowflake = "snowflake"
-
-	// Dnstt - Transport implemented in DNSTT.
-	Dnstt = "dnstt"
-)
+const Webtunnel = "webtunnel"
 
 // OnTransportEvents - Interface to get notified when the transport stopped again, when errors happened, or when
 // the transport actually got a full connection.
@@ -123,18 +40,13 @@ type OnTransportEvents interface {
 	// @param error The error that caused the transport to stop, or nil if the transport stopped without error.
 	Stopped(name string, error error)
 
-	// Error - Currently only called when an error happened during Snowflake proxy discovery: Either the WebRTC offer
-	// couldn't be created, the broker could not match us with a proxy, or the connection to the given proxy could not
-	// be made. This will continue until either Connected is called because of a successful connection to a proxy, or
-	// Controller.Stop is used to stop the transport again.
-	// When further connections are attempted by the client, the same cycle will repeat.
+	// Error reports transport errors.
 	//
 	// @param name The transport name that errored.
 	// @param error The error that occurred.
 	Error(name string, error error)
 
-	// Connected - This will always fire immediately before returning from Controller.Start, except with Snowflake,
-	// where it fires later, namely every time a successful connection to a proxy was achieved.
+	// Connected means the local transport listener is ready, not a Tor circuit.
 	//
 	// @param name The transport name that connected.
 	Connected(name string)
@@ -142,30 +54,6 @@ type OnTransportEvents interface {
 
 // Controller - Class to start and stop transports.
 type Controller struct {
-
-	// SnowflakeIceServers is a comma-separated list of ICE server addresses.
-	SnowflakeIceServers string
-
-	// SnowflakeBrokerUrl - URL of signaling broker.
-	SnowflakeBrokerUrl string
-
-	// SnowflakeFrontDomains is a comma-separated list of domains for either
-	// the domain fronting or AMP cache rendezvous methods.
-	SnowflakeFrontDomains string
-
-	// SnowflakeAmpCacheUrl - URL of AMP cache to use as a proxy for signaling.
-	// Only needed when you want to do the rendezvous over AMP instead of a domain fronted server.
-	SnowflakeAmpCacheUrl string
-
-	// SnowflakeSqsUrl - URL of SQS Queue to use as a proxy for signaling.
-	SnowflakeSqsUrl string
-
-	// SnowflakeSqsCreds - Credentials to access SQS Queue.
-	SnowflakeSqsCreds string
-
-	// SnowflakeMaxPeers - Capacity for number of multiplexed WebRTC peers. DEFAULTs to 1 if less than that.
-	SnowflakeMaxPeers int
-
 	stateDir        string
 	transportEvents OnTransportEvents
 	listeners       map[string]*pt.SocksListener
@@ -208,11 +96,6 @@ func NewController(stateDir string, enableLogging, unsafeLogging bool, logLevel 
 	if err := ptlog.SetLogLevel(logLevel); err != nil {
 		log.Printf("Failed to set log level: %s", err.Error())
 		ptlog.Warnf("Failed to set log level: %s", err.Error())
-	}
-
-	if err := transports.Init(); err != nil {
-		ptlog.Warnf("Failed to initialize transports: %s", err.Error())
-		return nil
 	}
 
 	c.listeners = make(map[string]*pt.SocksListener)
@@ -283,23 +166,7 @@ func clientHandler(f base.ClientFactory, conn *pt.SocksConn, proxyURL *url.URL,
 		return
 	}
 
-	dialFn := proxy.Direct.Dial
-	if proxyURL != nil {
-		dialer, err := proxy.FromURL(proxyURL, proxy.Direct)
-		if err != nil {
-			ptlog.Errorf("Error getting proxy dialer: %s", err.Error())
-			_ = conn.Reject()
-
-			if transportEvents != nil {
-				go transportEvents.Stopped(methodName, err)
-			}
-
-			return
-		}
-		dialFn = dialer.Dial
-	}
-
-	remote, err := f.Dial("tcp", conn.Req.Target, dialFn, args)
+	remote, err := dialTransport(f, conn.Req.Target, proxyURL, args, shutdown, 15*time.Second)
 	if err != nil {
 		ptlog.Errorf("Error dialing PT: %s", err.Error())
 
@@ -310,6 +177,7 @@ func clientHandler(f base.ClientFactory, conn *pt.SocksConn, proxyURL *url.URL,
 		return
 	}
 
+	defer remote.Close()
 	err = conn.Grant(&net.TCPAddr{IP: net.IPv4zero, Port: 0})
 	if err != nil {
 		ptlog.Errorf("conn.Grant error: %s", err)
@@ -320,8 +188,6 @@ func clientHandler(f base.ClientFactory, conn *pt.SocksConn, proxyURL *url.URL,
 
 		return
 	}
-
-	defer remote.Close()
 
 	done := make(chan struct{}, 2)
 	go copyLoop(conn, remote, done)
@@ -337,6 +203,60 @@ func clientHandler(f base.ClientFactory, conn *pt.SocksConn, proxyURL *url.URL,
 		ptlog.Noticef("call OnTransportEvents.Stopped")
 		go transportEvents.Stopped(methodName, nil)
 	}
+}
+
+// Bound DNS, TCP, TLS and the HTTP upgrade together. Closing the raw socket also
+// cancels Lyrebird handshakes and fixes its error paths that can leave it open.
+func dialTransport(f base.ClientFactory, target string, proxyURL *url.URL, args interface{}, shutdown <-chan struct{}, timeout time.Duration) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	go func() {
+		select {
+		case <-shutdown:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	dialer := &net.Dialer{}
+	var contextDialer proxy.ContextDialer = dialer
+	if proxyURL != nil {
+		p, err := proxy.FromURL(proxyURL, dialer)
+		if err != nil {
+			return nil, err
+		}
+		var ok bool
+		contextDialer, ok = p.(proxy.ContextDialer)
+		if !ok {
+			return nil, fmt.Errorf("proxy does not support cancellation")
+		}
+	}
+	var raw net.Conn
+	var stopClosing func() bool
+	remote, err := f.Dial("tcp", target, func(network, address string) (net.Conn, error) {
+		conn, err := contextDialer.DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		raw = conn
+		stopClosing = context.AfterFunc(ctx, func() { _ = conn.Close() })
+		return conn, nil
+	}, args)
+	if stopClosing != nil {
+		stopClosing()
+	}
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		if raw != nil {
+			_ = raw.Close()
+		}
+		if remote != nil {
+			_ = remote.Close()
+		}
+		return nil, err
+	}
+	return remote, nil
 }
 
 // Exchanges bytes between two ReadWriters.
@@ -358,8 +278,7 @@ func copyLoop(socks, sfconn io.ReadWriter, done chan struct{}) {
 
 // LocalAddress - Address of the given transport.
 //
-// @param methodName one of the constants `ScrambleSuit` (deprecated), `Obfs2` (deprecated), `Obfs3` (deprecated),
-// `Obfs4`, `MeekLite`, `Webtunnel`, `Dnstt` or `Snowflake`.
+// @param methodName must be Webtunnel.
 //
 // @return address string containing host and port where the given transport listens.
 func (c *Controller) LocalAddress(methodName string) string {
@@ -371,8 +290,7 @@ func (c *Controller) LocalAddress(methodName string) string {
 
 // Port - Port of the given transport.
 //
-// @param methodName one of the constants `ScrambleSuit` (deprecated), `Obfs2` (deprecated), `Obfs3` (deprecated),
-// `Obfs4`, `MeekLite`, `Webtunnel`, `Dnstt` or `Snowflake`.
+// @param methodName must be Webtunnel.
 //
 // @return port number on localhost where the given transport listens.
 func (c *Controller) Port(methodName string) int {
@@ -416,8 +334,7 @@ func createStateDir(path string) error {
 
 // Start - Start given transport.
 //
-// @param methodName one of the constants `ScrambleSuit` (deprecated), `Obfs2` (deprecated), `Obfs3` (deprecated),
-// `Obfs4`, `MeekLite`, `Webtunnel`, `Dnstt` or `Snowflake`.
+// @param methodName must be Webtunnel.
 //
 // @param proxy HTTP, SOCKS4 or SOCKS5 proxy to be used behind Lyrebird. E.g. "socks5://127.0.0.1:12345"
 //
@@ -435,143 +352,25 @@ func (c *Controller) Start(methodName string, proxy string) error {
 		}
 	}
 
-	switch methodName {
-	case Snowflake:
-		if proxyURL != nil {
-			ptlog.Errorf("Snowflake does not support proxies")
-			return fmt.Errorf("Snowflake does not support proxies")
-		}
-
-		extraArgs := &pt.Args{}
-		extraArgs.Add("fronts", c.SnowflakeFrontDomains)
-		extraArgs.Add("ice", c.SnowflakeIceServers)
-		extraArgs.Add("max", strconv.Itoa(max(1, c.SnowflakeMaxPeers)))
-		extraArgs.Add("url", c.SnowflakeBrokerUrl)
-		extraArgs.Add("ampcache", c.SnowflakeAmpCacheUrl)
-		extraArgs.Add("sqsqueue", c.SnowflakeSqsUrl)
-		extraArgs.Add("sqscreds", c.SnowflakeSqsCreds)
-
-		t := transports.Get(methodName)
-		if t == nil {
-			ptlog.Errorf("Failed to initialize %s: no such method", methodName)
-			return fmt.Errorf("failed to initialize %s: no such method", methodName)
-		}
-		f, err := t.ClientFactory(c.stateDir)
-		if err != nil {
-			ptlog.Errorf("Failed to initialize %s: %s", methodName, err.Error())
-			return err
-		}
-		ln, err := pt.ListenSocks("tcp", "127.0.0.1:0")
-		if err != nil {
-			ptlog.Errorf("Failed to initialize %s: %s", methodName, err.Error())
-			return err
-		}
-
-		f.OnEvent(func(e base.TransportEvent) {
-			switch ev := e.(type) {
-			case event.EventOnOfferCreated:
-				if ev.Error != nil && c.transportEvents != nil {
-					go c.transportEvents.Error(methodName, ev.Error)
-				}
-
-			case event.EventOnBrokerRendezvous:
-				if ev.Error != nil && c.transportEvents != nil {
-					go c.transportEvents.Error(methodName, ev.Error)
-				}
-
-			case event.EventOnSnowflakeConnected:
-				if c.transportEvents != nil {
-					go c.transportEvents.Connected(methodName)
-				}
-
-			case event.EventOnSnowflakeConnectionFailed:
-				if ev.Error != nil && c.transportEvents != nil {
-					go c.transportEvents.Error(methodName, ev.Error)
-				}
-
-			default:
-			}
-		})
-
-		c.shutdown[methodName] = make(chan struct{})
-		c.listeners[methodName] = ln
-
-		go acceptLoop(f, ln, nil, extraArgs, c.shutdown[methodName], methodName, c.transportEvents)
-
-	case Dnstt:
-		if proxyURL != nil {
-			ptlog.Errorf("DNSTT does not support proxies")
-			return fmt.Errorf("DNSTT does not support proxies")
-		}
-
-		ln, err := pt.ListenSocks("tcp", "127.0.0.1:0")
-		if err != nil {
-			ptlog.Errorf("Failed to initialize %s: %s", methodName, err.Error())
-			return err
-		}
-
-		c.listeners[methodName] = ln
-		c.shutdown[methodName] = make(chan struct{})
-
-		utlsClientHelloID, err := dnsttclient.SampleUTLSDistribution("4*random,3*Firefox_120,1*Firefox_105,3*Chrome_120,1*Chrome_102,1*iOS_14,1*iOS_13")
-		if err != nil {
-			ptlog.Errorf("Failed to initialize %s: %s", methodName, err.Error())
-			return err
-		}
-
-		go func() {
-			var wg sync.WaitGroup
-
-			go dnsttclient.AcceptLoop(ln, utlsClientHelloID, c.shutdown[methodName], &wg)
-
-			// We need to wait on the shutdown itself; the waitgroup will not be populated, yet.
-			<-c.shutdown[methodName]
-
-			// Wait on the spawned threads which handle all the SOCKS connections to finish.
-			wg.Wait()
-
-			// Finally, let the event listeners know that we stopped.
-			// (This is slightly different from the other transports, as we only notice when the whole transport
-			// stopped. Not when single SOCKS connections stopped. But we're not too phased about that now.
-			// Don't want to mangle the DNSTT code further.)
-			if c.transportEvents != nil {
-				ptlog.Noticef("call OnTransportEvents.Stopped")
-				go c.transportEvents.Stopped(methodName, nil)
-			}
-		}()
-
-		if c.transportEvents != nil {
-			go c.transportEvents.Connected(methodName)
-		}
-
-	default:
-		// at the moment, everything else is in lyrebird
-		t := transports.Get(methodName)
-		if t == nil {
-			ptlog.Errorf("Failed to initialize %s: no such method", methodName)
-			return fmt.Errorf("failed to initialize %s: no such method", methodName)
-		}
-
-		f, err := t.ClientFactory(c.stateDir)
-		if err != nil {
-			ptlog.Errorf("Failed to initialize %s: %s", methodName, err.Error())
-			return err
-		}
-
-		ln, err := pt.ListenSocks("tcp", "127.0.0.1:0")
-		if err != nil {
-			ptlog.Errorf("Failed to initialize %s: %s", methodName, err.Error())
-			return err
-		}
-
-		c.listeners[methodName] = ln
-		c.shutdown[methodName] = make(chan struct{})
-
-		go acceptLoop(f, ln, proxyURL, nil, c.shutdown[methodName], methodName, c.transportEvents)
-
-		if c.transportEvents != nil {
-			go c.transportEvents.Connected(methodName)
-		}
+	if methodName != Webtunnel {
+		return fmt.Errorf("unsupported transport: %s", methodName)
+	}
+	if _, exists := c.listeners[methodName]; exists {
+		return nil
+	}
+	f, err := webtunnel.Transport.ClientFactory(c.stateDir)
+	if err != nil {
+		return err
+	}
+	ln, err := pt.ListenSocks("tcp", "127.0.0.1:0")
+	if err != nil {
+		return err
+	}
+	c.listeners[methodName] = ln
+	c.shutdown[methodName] = make(chan struct{})
+	go acceptLoop(f, ln, proxyURL, nil, c.shutdown[methodName], methodName, c.transportEvents)
+	if c.transportEvents != nil {
+		go c.transportEvents.Connected(methodName)
 	}
 
 	ptlog.Noticef("Launched transport: %v", methodName)
@@ -581,8 +380,7 @@ func (c *Controller) Start(methodName string, proxy string) error {
 
 // Stop - Stop given transport.
 //
-// @param methodName one of the constants `ScrambleSuit` (deprecated), `Obfs2` (deprecated), `Obfs3` (deprecated),
-// `Obfs4`, `MeekLite`, `Webtunnel`, `Dnstt` or `Snowflake`.
+// @param methodName must be Webtunnel.
 func (c *Controller) Stop(methodName string) {
 	if ln, ok := c.listeners[methodName]; ok {
 		_ = ln.Close()
@@ -595,13 +393,6 @@ func (c *Controller) Stop(methodName string) {
 	} else {
 		ptlog.Warnf("No listener for %s", methodName)
 	}
-}
-
-// SnowflakeVersion - The version of Snowflake bundled with IPtProxy.
-//
-//goland:noinspection GoUnusedExportedFunction
-func SnowflakeVersion() string {
-	return sfversion.GetVersion()
 }
 
 // LyrebirdVersion - The version of Lyrebird bundled with IPtProxy.

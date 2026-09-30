@@ -12,17 +12,13 @@ import org.telegram.messenger.LocaleController
 import org.telegram.messenger.R
 import org.telegram.ui.ActionBar.AlertDialog
 import org.telegram.ui.ActionBar.Theme
-import org.telegram.ui.Cells.TextCell
 import org.telegram.ui.Components.BulletinFactory
-import org.telegram.ui.Components.ItemOptions
 import org.telegram.ui.Components.UItem
 import org.telegram.ui.Components.UniversalAdapter
 import org.telegram.ui.Components.UniversalFragment
 
 /** Tor settings page (ported from inugram), opened from the Bebragram connection settings. */
 class TorSettingsActivity : UniversalFragment() {
-    private val modes = listOf("webtunnel", "snowflake")
-    private val labels = listOf("WebTunnel", "Snowflake")
     private var ticker: Runnable? = null
 
     override fun getTitle(): CharSequence = LocaleController.getString(R.string.BebragramTorNetwork)
@@ -90,8 +86,6 @@ class TorSettingsActivity : UniversalFragment() {
             .setChecked(TorConfig.enabled))
         items.add(UItem.asCheck(ID_AUTOSTART, LocaleController.getString(R.string.BebragramTorAutostart))
             .setChecked(TorConfig.autostart))
-        items.add(UItem.asButton(ID_MODE, LocaleController.getString(R.string.BebragramTorMode),
-            labels.getOrElse(modes.indexOf(TorConfig.mode)) { "Direct" }))
         items.add(UItem.asButton(ID_BRIDGES, LocaleController.getString(R.string.BebragramTorBridgeLines), bridgeSummary()))
         items.add(UItem.asShadow(LocaleController.getString(R.string.BebragramTorHelp)))
         items.add(UItem.asButton(ID_FETCH, LocaleController.getString(R.string.BebragramTorFetch)).accent())
@@ -115,7 +109,6 @@ class TorSettingsActivity : UniversalFragment() {
                 TorConfig.autostart = !TorConfig.autostart
                 listView.adapter.update(true)
             }
-            ID_MODE -> showModeOptions(view)
             ID_BRIDGES -> showBridgeDialog()
             ID_FETCH -> fetchBridgesNow()
             ID_AUTO -> showAutoRefreshDialog()
@@ -198,21 +191,6 @@ class TorSettingsActivity : UniversalFragment() {
         }
     }
 
-    private fun showModeOptions(anchor: View) {
-        val options = ItemOptions.makeOptions(this, anchor)
-        modes.forEachIndexed { index, mode ->
-            options.addChecked(index == modes.indexOf(TorConfig.mode), labels[index]) {
-                if (modes[index] == TorConfig.mode) return@addChecked
-                if (TorConfig.enabled) TorProxyHelper.stop()
-                TorConfig.mode = mode
-                TorProxyHelper.prefetchBridges()
-                (anchor as? TextCell)?.setValue(labels[index], true)
-                listView.adapter.update(true)
-            }
-        }
-        options.show()
-    }
-
     private fun showBridgeDialog() {
         val ctx = parentActivity ?: return
         val input = EditText(ctx).apply {
@@ -276,7 +254,6 @@ class TorSettingsActivity : UniversalFragment() {
     companion object {
         private const val ID_ENABLE = 1
         private const val ID_AUTOSTART = 2
-        private const val ID_MODE = 3
         private const val ID_BRIDGES = 4
         private const val ID_STATUS = 5
         private const val ID_LOG = 6

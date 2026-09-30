@@ -64,4 +64,5 @@ abstract class BroadcastReceiver { abstract fun onReceive(context: Context?, int
 interface ServiceConnection {
     fun onServiceConnected(name: ComponentName?, binder: IBinder?)
     fun onServiceDisconnected(name: ComponentName?)
+    fun onNullBinding(name: ComponentName?) {}
 }

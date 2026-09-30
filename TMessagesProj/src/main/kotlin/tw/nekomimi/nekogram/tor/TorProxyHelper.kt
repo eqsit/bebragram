@@ -62,7 +62,13 @@ object TorProxyHelper {
     private var reconnectWhenOnline = false
     private var reconnectWhenVpnOff = false
     @Volatile private var failedBridgeLines = emptySet<String>()
-    @Volatile private var bridgeRefreshInFlight = false
+    private data class BridgeRefresh(
+        val mode: String, val token: Int,
+        var restartStarting: Boolean,
+        val callbacks: MutableList<java.util.function.IntConsumer> = mutableListOf()
+    )
+    private var bridgeRefresh: BridgeRefresh? = null
+    private val prefetching = mutableSetOf<String>()
     private var rotationAttempts = 0
     private const val BRIDGE_CACHE_TTL_MS = 2L * 24 * 60 * 60 * 1000
     private var ownedProxy = false
@@ -94,7 +100,11 @@ object TorProxyHelper {
     private fun newConnection(token: Int): ServiceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
             if (connection !== this || !bound) return
-            val tor = binder?.let { TorRemote(it) } ?: return
+            if (binder == null) {
+                onNullBinding(name)
+                return
+            }
+            val tor = TorRemote(binder)
             torBinder = binder
             val sessionConnection = this
             try {
@@ -176,6 +186,21 @@ object TorProxyHelper {
             val binder = torBinder ?: return
             if (binder.isBinderAlive == false) onTorProcessDied(this, binder)
         }
+
+        override fun onNullBinding(name: ComponentName?) {
+            if (connection !== this) return
+            // No Binder/death callback will ever arrive for a null binding.
+            val stopping = status == "STOPPING"
+            unbindTor()
+            connection = null
+            torBinder = null
+            service = null
+            if (stopping) {
+                finishStopping()
+            } else {
+                fail("Tor service returned no control connection")
+            }
+        }
     }
 
     private fun unbindTor() {
@@ -196,26 +221,31 @@ object TorProxyHelper {
         torBinder = null
         service = null
         if (stopping) {
-            status = when {
-                reconnectWhenVpnOff -> "WAITING_FOR_VPN"
-                reconnectWhenOnline -> "WAITING_FOR_NETWORK"
-                stopError != null -> "ERROR: $stopError"
-                else -> "OFF"
-            }
-            if (startQueued && TorConfig.enabled) {
-                startQueued = false
-                start()
-            } else if (reconnectWhenVpnOff && !ProxyUtil.isVpnProxySuppressionActive() && hasInternet()) {
-                reconnectWhenVpnOff = false
-                start()
-            } else if (reconnectWhenOnline && hasInternet()) {
-                reconnectWhenOnline = false
-                start()
-            }
+            finishStopping()
         } else if (TorConfig.enabled && (status == "ON" || status == "STARTING")) {
             fail("Tor process stopped")
         }
     }
+
+    private fun finishStopping() {
+        status = when {
+            reconnectWhenVpnOff -> "WAITING_FOR_VPN"
+            reconnectWhenOnline -> "WAITING_FOR_NETWORK"
+            stopError != null -> "ERROR: $stopError"
+            else -> "OFF"
+        }
+        if (startQueued && TorConfig.enabled) {
+            startQueued = false
+            start()
+        } else if (reconnectWhenVpnOff && !ProxyUtil.isVpnProxySuppressionActive() && hasInternet()) {
+            reconnectWhenVpnOff = false
+            start()
+        } else if (reconnectWhenOnline && hasInternet()) {
+            reconnectWhenOnline = false
+            start()
+        }
+    }
+
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == TorService.ACTION_ERROR) {
@@ -239,7 +269,7 @@ object TorProxyHelper {
         }
 
         override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
-            if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+            if (capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
                 scheduleNetworkAction(network)
             }
         }
@@ -249,11 +279,13 @@ object TorProxyHelper {
         }
     }
 
+    // Android's connectivity probe can be blocked while bridges remain reachable.
+    // Do not require Google's/captive-portal validation to permit a Tor attempt.
     private fun hasInternet(): Boolean {
         val connectivity = app.getSystemService(ConnectivityManager::class.java) ?: return false
         val network = connectivity.activeNetwork ?: return false
         return connectivity.getNetworkCapabilities(network)
-            ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+            ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
     }
 
     private fun scheduleNetworkAction(network: Network) {
@@ -366,7 +398,7 @@ object TorProxyHelper {
                     activeAutoBridges = networkBridges.third
                     TorLog.add("bridges: reusing the connected session's bridges after network change")
                     networkBridges.second
-                } else bridgeLines(mode)
+                } else bridgeLines(mode, token)
                 if (token != generation) {
                     TorLog.add("start cancelled before transports")
                     return@execute
@@ -374,19 +406,12 @@ object TorProxyHelper {
                 val names = TorBridgeConfig.transports(mode, bridges)
                 val ports = mutableMapOf<String, Long>()
                 if (names.isNotEmpty()) {
-                    if ("snowflake" in names) {
-                        val sf = bridges.lineSequence().map { it.trim().removePrefix("Bridge ").trim() }
-                            .first { it.startsWith("snowflake ") || it.startsWith("snowflake\t") }
-                        controller.snowflakeBrokerUrl = valueOf(sf, "url")
-                        controller.snowflakeFrontDomains = valueOf(sf, "fronts").ifEmpty { valueOf(sf, "front") }
-                        controller.snowflakeIceServers = valueOf(sf, "ice")
-                        valueOf(sf, "ampcache").takeIf { it.isNotEmpty() }?.let { controller.snowflakeAmpCacheUrl = it }
-                    }
                     for (name in names) {
                         if (token != generation) return@execute
-                        if (name in startedTransports) continue
-                        controller.start(name, null)
-                        startedTransports.add(name)
+                        if (name !in startedTransports) {
+                            controller.start(name, null)
+                            startedTransports.add(name)
+                        }
                         ports[name] = controller.port(name)
                         TorLog.add("transport $name listening on ${ports[name]}")
                     }
@@ -421,7 +446,13 @@ object TorProxyHelper {
         }
     }
 
-    fun stop() {
+    fun stop() = stopInternal(resetRecovery = true)
+
+    private fun stopInternal(resetRecovery: Boolean) {
+        if (resetRecovery) {
+            rotationAttempts = 0
+            failedBridgeLines = emptySet()
+        }
         TorLog.add("stop requested (status=$status)")
         TorConfig.enabled = false
         reconnectWhenOnline = false
@@ -481,7 +512,7 @@ object TorProxyHelper {
         TorLog.add("FAIL: $reason")
         val offline = !hasInternet()
         lastError = reason
-        stop()
+        stopInternal(resetRecovery = false)
         stopError = reason
         TorConfig.enabled = true // transient failures must not disable the user's autostart preference
         if (offline) {
@@ -526,10 +557,10 @@ object TorProxyHelper {
         if (mode == "direct" || mode == "custom") return
         val lines = activeBridgeLines
         if (lines.isBlank()) return
-        failedBridgeLines = lines.lineSequence().filter { it.isNotBlank() }.toSet()
+        failedBridgeLines = failedBridgeLines + lines.lineSequence().filter { it.isNotBlank() }.toSet()
         rotationAttempts++
-        TorLog.add("bridges: retry $rotationAttempts after \"$reason\" (previous lines deprioritized)")
-        refreshBridges()
+        TorLog.add("bridges: retry $rotationAttempts after \"$reason\" (previous lines excluded)")
+        refreshBridgesInternal(restartStarting = true, callback = null)
     }
 
     @JvmStatic fun isTorProxy(proxy: SharedConfig.ProxyInfo): Boolean = proxy == localProxy
@@ -569,6 +600,8 @@ object TorProxyHelper {
         val proxy = existing ?: SharedConfig.addProxy(SharedConfig.ProxyInfo("127.0.0.1", port, "", "", ""))
         localProxy = proxy
         rotationAttempts = 0
+        failedBridgeLines = emptySet()
+        lastError = null
         SharedConfig.currentProxy = proxy
         MessagesController.getGlobalMainSettings().edit {
             putBoolean("proxy_enabled", !vpnSuppressed)
@@ -669,6 +702,8 @@ object TorProxyHelper {
      */
     @JvmStatic
     fun refreshBridges(callback: java.util.function.IntConsumer? = null) {
+        rotationAttempts = 0
+        failedBridgeLines = emptySet()
         refreshBridgesInternal(restartStarting = true, callback = callback)
     }
 
@@ -687,38 +722,52 @@ object TorProxyHelper {
             callback?.accept(-1)
             return
         }
-        if (bridgeRefreshInFlight) {
-            callback?.accept(-1)
+        val existing = bridgeRefresh
+        if (existing != null && existing.mode == mode && existing.token == generation) {
+            existing.restartStarting = existing.restartStarting || restartStarting
+            callback?.let { existing.callbacks.add(it) }
             return
         }
-        bridgeRefreshInFlight = true
         val token = generation
         val previousLines = TorConfig.bridgesFor(mode)
+        val request = BridgeRefresh(mode, token, restartStarting)
+        callback?.let { request.callbacks.add(it) }
+        bridgeRefresh = request
+        fun complete(count: Int) {
+            if (bridgeRefresh === request) bridgeRefresh = null
+            request.callbacks.forEach { it.accept(count) }
+        }
         bridgeWorker.execute {
+            if (token != generation) {
+                AndroidUtilities.runOnUIThread { complete(-1) }
+                return@execute
+            }
             val fresh = try {
-                githubBridges(mode)
+                githubBridges(mode, token)
             } catch (e: Exception) {
                 null
             }
+            if (token != generation) {
+                AndroidUtilities.runOnUIThread { complete(-1) }
+                return@execute
+            }
             val lines = fresh ?: runCatching {
-                rankByPing(bundledBridges(mode).lines().take(MAX_PING_CANDIDATES), SELECTED_BRIDGES).joinToString("\n")
+                rankByPing(bundledBridges(mode).lines().filterNot { it in failedBridgeLines }.take(MAX_PING_CANDIDATES), SELECTED_BRIDGES, token = token).joinToString("\n")
             }.getOrNull()
             if (lines.isNullOrBlank()) {
                 TorLog.add("bridge refresh failed: no $mode bridges")
                 AndroidUtilities.runOnUIThread {
-                    bridgeRefreshInFlight = false
-                    callback?.accept(-1)
+                    complete(-1)
                 }
                 return@execute
             }
             val count = countBridges(lines)
             cacheBridges(mode, lines)
             AndroidUtilities.runOnUIThread {
-                bridgeRefreshInFlight = false
                 // A completed fetch must not overwrite pasted bridges or restart a
                 // session the user stopped while the network request was running.
                 if (token != generation || mode != TorConfig.mode || TorConfig.bridgesFor(mode) != previousLines) {
-                    callback?.accept(-1)
+                    complete(-1)
                     return@runOnUIThread
                 }
                 TorConfig.setBridgesFor(mode, lines)
@@ -726,11 +775,11 @@ object TorProxyHelper {
                 TorConfig.setLastBridgeRefreshFor(mode, System.currentTimeMillis())
                 TorLog.add("bridges: refreshed $count $mode line(s)")
                 val restart = TorConfig.enabled && status != "ON" &&
-                    (status != "STARTING" || restartStarting)
+                    (status != "STARTING" || request.restartStarting)
                 if (TorConfig.enabled && !restart) {
                     TorLog.add("bridges: saved for the next start; keeping current Tor session")
                 }
-                callback?.accept(count)
+                complete(count)
                 if (restart && token == generation && TorConfig.enabled && TorConfig.mode == mode) restartForNewBridges()
             }
         }
@@ -741,7 +790,7 @@ object TorProxyHelper {
             Triple(TorConfig.mode, activeBridgeLines, activeAutoBridges)
         } else null
         TorLog.add(if (reusable != null) "restarting Tor with the connected session's bridges" else "restarting Tor with refreshed bridges")
-        stop()
+        stopInternal(resetRecovery = false)
         pendingNetworkBridges = reusable
         start()
     }
@@ -773,24 +822,36 @@ object TorProxyHelper {
         if (mode == "direct" || mode == "custom") return
         if (TorConfig.bridgesFor(mode).isNotBlank()) return
         if (cachedBridges(mode) != null) return
+        if (!prefetching.add(mode)) return
         bridgeWorker.execute {
             try {
+                if (cachedBridges(mode) != null) return@execute
                 githubBridges(mode)?.let {
                     cacheBridges(mode, it)
                     TorLog.add("bridges: prefetched ${countBridges(it)} $mode line(s)")
                 }
             } catch (e: Exception) {
                 TorLog.add("bridge prefetch failed: ${e.message ?: e.javaClass.simpleName}")
+            } finally {
+                AndroidUtilities.runOnUIThread { prefetching.remove(mode) }
             }
         }
     }
 
     /** Resolve bridge lines for [mode]: manual input, then fresh GitHub lists, then bundled. */
-    fun bridgeLines(mode: String): String {
+    fun bridgeLines(mode: String, token: Int? = null): String {
         activeAutoBridges = false
         activeBridgeLines = ""
         if (mode == "direct") return ""
-        val manual = TorConfig.bridgesFor(mode)
+        var manual = TorConfig.bridgesFor(mode)
+        if (manual.isNotBlank()) {
+            if (TorConfig.autoManagedFor(mode)) {
+                manual = validBridgeLines(mode, manual).joinToString("\n")
+                if (manual.isBlank()) TorLog.add("bridges: ignoring invalid saved $mode lines")
+            } else {
+                manual = TorBridgeConfig.lines(mode, manual).joinToString("\n")
+            }
+        }
         if (manual.isNotBlank()) {
             activeBridgeLines = manual
             activeAutoBridges = TorConfig.autoManagedFor(mode)
@@ -804,13 +865,14 @@ object TorProxyHelper {
             TorLog.add("bridges: ${countBridges(it)} cached $mode line(s)")
             return it
         }
-        githubBridges(mode)?.let {
+        githubBridges(mode, token)?.let {
             activeBridgeLines = it
             activeAutoBridges = true
             TorLog.add("bridges: fetched ${countBridges(it)} $mode line(s) from github")
             cacheBridges(mode, it)
             return it
         }
+        if (token != null && token != generation) throw java.util.concurrent.CancellationException("Tor start cancelled")
         val bundled = bundledBridges(mode)
         activeBridgeLines = bundled
         activeAutoBridges = true
@@ -826,7 +888,9 @@ object TorProxyHelper {
             "No built-in $mode bridges shipped and the fetch failed - paste your own lines under Bridge lines"
         )
         if (entries.length() == 0) throw IllegalArgumentException("No built-in $mode bridges available and all fetch sources failed. Paste a fresh $mode bridge line in Bridge lines.")
-        return (0 until entries.length()).joinToString("\n") { entries.getString(it) }
+        val lines = validBridgeLines(mode, (0 until entries.length()).joinToString("\n") { entries.getString(it) })
+        require(lines.isNotEmpty()) { "No valid built-in $mode bridges" }
+        return lines.joinToString("\n")
     }
 
     private fun cachedBridges(mode: String): String? {
@@ -835,7 +899,7 @@ object TorProxyHelper {
         if (split <= 0) return null
         val age = System.currentTimeMillis() - (raw.substring(0, split).toLongOrNull() ?: return null)
         if (age < 0 || age > BRIDGE_CACHE_TTL_MS) return null
-        return raw.substring(split + 1).takeIf { it.isNotBlank() }
+        return validBridgeLines(mode, raw.substring(split + 1)).joinToString("\n").takeIf { it.isNotBlank() }
     }
 
     private fun cacheBridges(mode: String, bridges: String) {
@@ -856,41 +920,44 @@ object TorProxyHelper {
      * Sample up to 12 distinct endpoints from GitHub lists and keep three responsive ones.
      * This is only an endpoint check; Tor bootstrap is the actual bridge check.
      */
-    private fun githubBridges(mode: String): String? {
+    private fun githubBridges(mode: String, token: Int? = null): String? {
         val files = when (mode) {
             "webtunnel" -> listOf("bridge/webtunnel_72h.txt", "bridge/webtunnel.txt")
-            "snowflake" -> listOf("bridge/snowflake.txt")
-            "obfs4" -> listOf("bridge/obfs4_72h.txt", "bridge/obfs4_tested.txt")
             else -> return null
         }
-        for (base in githubSources) {
-            val pool = LinkedHashMap<Pair<String, Int>, String>()
-            for (file in files) {
-                val text = httpGet(base + file) ?: continue
-                text.lineSequence()
-                    .map { it.trim() }
-                    .filter { it.isNotEmpty() && !it.startsWith("#") }
-                    .map { if (it.startsWith("Bridge ")) it.substring(7).trim() else it }
-                    .filter { it.startsWith("$mode ") }
-                    .forEach { line ->
-                        val endpoint = pingTarget(line)
-                        if (endpoint != null) {
-                            pool.putIfAbsent(endpoint, line)
-                        }
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(16)
+        for (file in files) {
+            if (token != null && token != generation) return null
+            val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime())
+            if (remainingMs <= 0) break
+            // Race mirrors, trying the short fresh list before the larger fallback.
+            val downloads = githubSources.map { base ->
+                java.util.concurrent.Callable {
+                    httpGet(base + file)?.let {
+                        validBridgeLines(mode, it).filterNot { line -> line in failedBridgeLines }
+                            .takeIf { lines -> lines.isNotEmpty() }
                     }
-                if (pool.size >= MAX_PING_CANDIDATES) break
+                }
             }
-            if (pool.isEmpty()) continue
-            val candidates = pool.values.shuffled().sortedBy { it in failedBridgeLines }.take(MAX_PING_CANDIDATES)
-            val ranked = rankByPing(candidates, SELECTED_BRIDGES)
+            val pool = TorBridgeTasks.collect(downloads, minOf(8_000L, remainingMs), 1) {
+                token != null && token != generation
+            }.firstOrNull() ?: continue
+            val candidates = pool.shuffled().take(MAX_PING_CANDIDATES)
+            val probeMs = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime())
+            if (probeMs <= 0) break
+            val ranked = rankByPing(candidates, SELECTED_BRIDGES, minOf(4_000L, probeMs), token)
             if (ranked.isNotEmpty()) {
-                TorLog.add("bridges: github ${pool.size} candidates, ${ranked.size} reachable endpoints selected for $mode")
+                TorLog.add("bridges: ${pool.size} valid candidates, ${ranked.size} selected for $mode; bootstrap will verify them")
                 return ranked.joinToString("\n")
             }
-            TorLog.add("bridges: no reachable $mode endpoints in github list")
+            TorLog.add("bridges: no reachable $mode endpoints in $file; trying fallback")
         }
         return null
     }
+
+    private fun validBridgeLines(mode: String, text: String): List<String> = text.lineSequence()
+        .flatMap { runCatching { TorBridgeConfig.lines(mode, it).asSequence() }.getOrDefault(emptySequence()) }
+        .distinct().toList()
 
     /** TCP-connect time to the endpoint that actually matters for this bridge line. */
     private fun pingHost(host: String, port: Int, timeoutMs: Int = 1500): Long {
@@ -905,14 +972,14 @@ object TorProxyHelper {
         }
     }
 
-    /** WebTunnel and Snowflake connect through their url= host, not through the placeholder address. */
+    /** WebTunnel connects through its url= host, not through the placeholder address. */
     private fun pingTarget(line: String): Pair<String, Int>? {
         val url = valueOf(line, "url").ifEmpty { valueOf(line, "ampcache") }
         if (url.isNotEmpty()) {
             return try {
                 val uri = java.net.URI(url)
                 val host = uri.host ?: return null
-                host to (if (uri.port > 0) uri.port else 443)
+                host to (if (uri.port > 0) uri.port else if (uri.scheme == "http") 80 else 443)
             } catch (e: Exception) {
                 null
             }
@@ -954,25 +1021,15 @@ object TorProxyHelper {
     }
 
     /** Returns only endpoints that answered the check, fastest first. */
-    private fun rankByPing(candidates: List<String>, limit: Int): List<String> {
+    private fun rankByPing(candidates: List<String>, limit: Int, timeoutMs: Long = 4_000, token: Int? = null): List<String> {
         if (candidates.isEmpty()) return emptyList()
-        val pool = java.util.concurrent.Executors.newFixedThreadPool(10)
-        return try {
-            candidates.map { line ->
-                pool.submit(java.util.concurrent.Callable {
-                    line to checkEndpoint(line)
-                })
-            }
-                .mapNotNull { runCatching { it.get(4, java.util.concurrent.TimeUnit.SECONDS) }.getOrNull() }
-                .filter { it.second != null }
-                .sortedBy { it.second }
-                .map { it.first }
-                .take(limit)
-        } catch (e: Exception) {
-            emptyList()
-        } finally {
-            pool.shutdownNow()
+        val tasks = candidates.distinct().map { line ->
+            java.util.concurrent.Callable { checkEndpoint(line)?.let { line to it } }
         }
+        // One deadline for the entire batch, collect in completion order, and return
+        // as soon as enough endpoints answer instead of waiting for every dead bridge.
+        return TorBridgeTasks.collect(tasks, timeoutMs, limit) { token != null && token != generation }
+            .sortedBy { it.second }.map { it.first }
     }
 
     private fun httpGet(url: String): String? {
@@ -993,12 +1050,13 @@ object TorProxyHelper {
             connection.inputStream.bufferedReader().use { reader ->
                 val buffer = CharArray(8192)
                 val result = StringBuilder()
-                while (result.length <= 1_000_000) {
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(7)
+                while (result.length <= 1_000_000 && !Thread.currentThread().isInterrupted && System.nanoTime() < deadline) {
                     val count = reader.read(buffer)
                     if (count < 0) return@use result.toString()
                     result.append(buffer, 0, count)
                 }
-                TorLog.add("bridge fetch: list too large")
+                TorLog.add("bridge fetch: list too large or request budget exhausted")
                 null
             }
         } catch (e: Exception) {

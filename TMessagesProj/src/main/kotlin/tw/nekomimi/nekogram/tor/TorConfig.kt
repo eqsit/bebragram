@@ -67,7 +67,7 @@ object TorConfig {
         store().edit().putString("tor_bridges_$mode", value).apply()
     }
 
-    /** One-time migration: per-mode bridge slots, and only webtunnel/snowflake are offered in the UI. */
+    /** One-time migration: per-mode bridge slots, and migrate retired transports to WebTunnel. */
     fun migrateLegacy() {
         val store = store()
         if (store.contains("tor_bridges")) {
@@ -84,7 +84,7 @@ object TorConfig {
             }
             store.edit().remove("tor_bridges_auto").remove("tor_bridges_refreshed_at").apply()
         }
-        if (mode !in setOf("webtunnel", "snowflake")) {
+        if (mode != "webtunnel") {
             mode = "webtunnel"
         }
     }
