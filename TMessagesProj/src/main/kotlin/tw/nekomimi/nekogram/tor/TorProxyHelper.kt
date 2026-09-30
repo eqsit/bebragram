@@ -94,6 +94,13 @@ object TorProxyHelper {
         private set
     @Volatile var lastError: String? = null
         private set
+    @Volatile var telegramPingMs = -1L
+        private set
+    @Volatile var checkingTelegram = false
+        private set
+    private var pingRequest = 0
+    private var lastTelegramState = -1
+    private var proxyStartedAt = 0L
 
     /**
      * One Controller per process, like Orbot does. gomobile keeps a Java/Go reference table
@@ -462,10 +469,13 @@ object TorProxyHelper {
                 activeBridgeMode = mode
                 TorLog.add("start: mode=$mode")
                 val bridges = if (networkBridges != null && networkBridges.first == mode) {
-                    activeBridgeLines = networkBridges.second
                     activeAutoBridges = networkBridges.third
-                    TorLog.add("bridges: reusing the connected session's bridges after network change")
-                    networkBridges.second
+                    val lines = if (networkBridges.third) {
+                        recheckNetworkBridges(mode, networkBridges.second, token)
+                    } else networkBridges.second
+                    activeBridgeLines = lines
+                    TorLog.add("bridges: reusing reachable session candidates after network change")
+                    lines
                 } else bridgeLines(mode, token)
                 if (token != generation) {
                     TorLog.add("start cancelled before transports")
@@ -548,6 +558,9 @@ object TorProxyHelper {
         healthCheckInFlight = false
         missedHealthChecks = 0
         circuitMissingSince = -1L
+        telegramPingMs = -1L
+        checkingTelegram = false
+        ++pingRequest
         recoveryRetry?.let { AndroidUtilities.cancelRunOnUIThread(it) }
         recoveryRetry = null
         AndroidUtilities.cancelRunOnUIThread(healthTick)
@@ -616,11 +629,7 @@ object TorProxyHelper {
     }
 
     private fun hasBuiltCircuit(tor: TorRemote): Boolean =
-        tor.getInfo("circuit-status")?.lineSequence()?.any { line ->
-            val parts = line.trim().split(Regex("\\s+"))
-            parts.getOrNull(1) == "BUILT" && parts.contains("PURPOSE=GENERAL") &&
-                (parts.getOrNull(2)?.split(',')?.size ?: 0) >= 3
-        } == true
+        TorCircuitStatus.hasUsableCircuit(tor.getInfo("circuit-status"))
 
     /** Check Tor's current circuits; bootstrap's historical success flag alone is insufficient. */
     private val healthTick = object : Runnable {
@@ -642,6 +651,7 @@ object TorProxyHelper {
                 AndroidUtilities.runOnUIThread {
                     if (token != generation || status != "ON") return@runOnUIThread
                     healthCheckInFlight = false
+                    logTelegramState()
                     missedHealthChecks = if (established || dormant) 0 else missedHealthChecks + 1
                     val now = SystemClock.elapsedRealtime()
                     if (established || dormant) circuitMissingSince = -1L
@@ -718,6 +728,45 @@ object TorProxyHelper {
 
     @JvmStatic fun isTorProxy(proxy: SharedConfig.ProxyInfo): Boolean = proxy == localProxy
 
+    /** User-requested Telegram round trip, not a repeating network probe. */
+    fun checkTelegramConnection() {
+        val proxy = localProxy ?: return
+        if (status != "ON" || checkingTelegram) return
+        val token = generation
+        val request = ++pingRequest
+        checkingTelegram = true
+        telegramPingMs = -1
+        fun complete(time: Long) {
+            if (token != generation || request != pingRequest || localProxy !== proxy || !checkingTelegram) return
+            checkingTelegram = false
+            telegramPingMs = time
+            TorLog.add(if (time >= 0) "Telegram round trip through Tor: ${time}ms" else
+                "Telegram round trip through Tor failed or timed out")
+        }
+        try {
+            ConnectionsManager.getInstance(org.telegram.messenger.UserConfig.selectedAccount)
+                .checkProxy(proxy.address, proxy.port, "", "", "") { time ->
+                    AndroidUtilities.runOnUIThread { complete(time) }
+                }
+            AndroidUtilities.runOnUIThread({ complete(-1) }, 30_000L)
+        } catch (e: Exception) {
+            complete(-1)
+        }
+    }
+
+    private fun logTelegramState() {
+        val state = ConnectionsManager.getInstance(org.telegram.messenger.UserConfig.selectedAccount).connectionState
+        if (state == lastTelegramState) return
+        lastTelegramState = state
+        val name = when (state) {
+            ConnectionsManager.ConnectionStateConnected -> "connected"
+            ConnectionsManager.ConnectionStateUpdating -> "updating"
+            ConnectionsManager.ConnectionStateWaitingForNetwork -> "waiting for network"
+            else -> "connecting"
+        }
+        TorLog.add("Telegram state: $name (${SystemClock.elapsedRealtime() - proxyStartedAt}ms after proxy selected)")
+    }
+
     /** Stop Tor when another proxy is chosen, rather than fighting for SharedConfig.currentProxy. */
     @JvmStatic fun onOtherProxySelected() {
         if (!TorConfig.enabled) return
@@ -767,6 +816,9 @@ object TorProxyHelper {
             putString("proxy_secret", "")
         }
         ConnectionsManager.setProxySettings(!vpnSuppressed, proxy.address, proxy.port, "", "", "")
+        proxyStartedAt = SystemClock.elapsedRealtime()
+        lastTelegramState = -1
+        logTelegramState()
         TorLog.add("Telegram proxy -> ${proxy.address}:${proxy.port} (calls off)" +
             if (vpnSuppressed) ", left disabled while VPN is active" else "")
         // Stock rotation would silently swap the proxy out from under Tor.
@@ -1073,18 +1125,47 @@ object TorProxyHelper {
 
     /** Standby candidates still need an endpoint check, but no list download on failure. */
     private fun cachedStandbyBridges(mode: String, token: Int): String? {
-        val raw = app.getSharedPreferences("bebragram", Context.MODE_PRIVATE)
-            .getString("${cacheKey(mode)}_standby", null) ?: return null
-        val split = raw.indexOf('|')
-        if (split <= 0) return null
-        val age = System.currentTimeMillis() - (raw.substring(0, split).toLongOrNull() ?: return null)
-        if (age !in 0..BRIDGE_CACHE_TTL_MS) return null
-        val candidates = distinctEndpoints(validBridgeLines(mode, raw.substring(split + 1))
+        val candidates = distinctEndpoints(standbyCandidates(mode)
             .filterNot { it in failedBridgeLines }.shuffled()).take(MAX_PING_CANDIDATES)
         if (candidates.isEmpty()) return null
         TorLog.add("bridges: checking ${candidates.size} standby candidates before fetching lists")
         return rankByPing(candidates, SELECTED_BRIDGES, token = token)
             .joinToString("\n").takeIf { it.isNotBlank() }
+    }
+
+    private fun standbyCandidates(mode: String): List<String> {
+        val raw = app.getSharedPreferences("bebragram", Context.MODE_PRIVATE)
+            .getString("${cacheKey(mode)}_standby", null) ?: return emptyList()
+        val split = raw.indexOf('|')
+        if (split <= 0) return emptyList()
+        val age = System.currentTimeMillis() - (raw.substring(0, split).toLongOrNull() ?: return emptyList())
+        if (age !in 0..BRIDGE_CACHE_TTL_MS) return emptyList()
+        return validBridgeLines(mode, raw.substring(split + 1))
+    }
+
+    /** A successful LTE probe says nothing about the same endpoint on Wi-Fi. */
+    private fun recheckNetworkBridges(mode: String, previous: String, token: Int): String {
+        failedBridgeLines = emptySet()
+        rotationAttempts = 0
+        val candidates = distinctEndpoints(validBridgeLines(mode, previous) + standbyCandidates(mode).shuffled())
+            .take(MAX_PING_CANDIDATES)
+        TorLog.add("bridges: checking ${candidates.size} session/standby endpoints on the new network")
+        // Two responsive endpoints suffice for a quick handover. Waiting for six
+        // forces every switch to pay dead endpoints' full timeout, even with a
+        // working pair already available. The larger standby pool stays cached.
+        val checked = rankByPing(candidates, minOf(2, candidates.size), token = token).joinToString("\n")
+        if (token != generation) throw java.util.concurrent.CancellationException("Network check cancelled")
+        val lines = checked.ifBlank {
+            TorLog.add("bridges: saved endpoints unavailable on the new network; fetching fresh candidates")
+            githubBridges(mode, token) ?: throw IllegalStateException("No reachable bridges on the new network")
+        }
+        cacheBridges(mode, lines)
+        AndroidUtilities.runOnUIThread {
+            if (token == generation && TorConfig.mode == mode && TorConfig.autoManagedFor(mode)) {
+                TorConfig.setBridgesFor(mode, lines)
+            }
+        }
+        return lines
     }
 
     /** Bridge sources that are reachable from Russia: GitHub raw + jsDelivr mirror. */
@@ -1103,6 +1184,15 @@ object TorProxyHelper {
             else -> return null
         }
         val selected = LinkedHashSet<String>()
+        val allCandidates = LinkedHashSet<String>()
+        fun saveStandby() {
+            val selectedHosts = selected.map { bridgeEndpoint(it) }.toSet()
+            val standby = distinctEndpoints(allCandidates.filterNot { bridgeEndpoint(it) in selectedHosts }
+                .shuffled()).take(48).joinToString("\n")
+            app.getSharedPreferences("bebragram", Context.MODE_PRIVATE).edit {
+                putString("${cacheKey(mode)}_standby", "${System.currentTimeMillis()}|$standby")
+            }
+        }
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(16)
         for (file in files) {
             if (token != null && token != generation) return null
@@ -1120,6 +1210,7 @@ object TorProxyHelper {
             val pool = TorBridgeTasks.collect(downloads, minOf(8_000L, remainingMs), 1) {
                 token != null && token != generation
             }.firstOrNull() ?: continue
+            allCandidates.addAll(pool)
             val selectedEndpoints = selected.map { bridgeEndpoint(it) }.toSet()
             val candidates = distinctEndpoints(pool.filterNot { bridgeEndpoint(it) in selectedEndpoints }
                 .shuffled()).take(MAX_PING_CANDIDATES)
@@ -1128,17 +1219,17 @@ object TorProxyHelper {
             val ranked = rankByPing(candidates, SELECTED_BRIDGES, minOf(4_000L, probeMs), token)
             if (ranked.isNotEmpty()) {
                 selected.addAll(ranked)
-                val standby = distinctEndpoints(pool.filterNot { it in ranked }.shuffled()).take(48).joinToString("\n")
-                app.getSharedPreferences("bebragram", Context.MODE_PRIVATE).edit {
-                    putString("${cacheKey(mode)}_standby", "${System.currentTimeMillis()}|$standby")
-                }
                 TorLog.add("bridges: ${pool.size} valid candidates, ${ranked.size} selected for $mode; bootstrap will verify them")
-                if (selected.size >= SELECTED_BRIDGES) return selected.take(SELECTED_BRIDGES).joinToString("\n")
+                if (selected.size >= SELECTED_BRIDGES) {
+                    saveStandby()
+                    return selected.take(SELECTED_BRIDGES).joinToString("\n")
+                }
                 TorLog.add("bridges: only ${selected.size} candidates so far; checking the other list")
                 continue
             }
             TorLog.add("bridges: no reachable $mode endpoints in $file; trying fallback")
         }
+        if (selected.isNotEmpty()) saveStandby()
         return selected.joinToString("\n").takeIf { it.isNotBlank() }
     }
 

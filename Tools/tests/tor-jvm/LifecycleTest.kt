@@ -57,7 +57,8 @@ private fun refreshWithoutRestart(app: Context, expectedStatus: String) {
     TorConfig.mode = "direct"
 }
 
-class TestBinder(private val broken: Boolean = false, private val bootstrapProgress: Int = 100) : IBinder {
+class TestBinder(private val broken: Boolean = false, private val bootstrapProgress: Int = 100,
+    private val circuitPurpose: String = "GENERAL") : IBinder {
     @Volatile var liveCircuit = true
     @Volatile var dormant = false
     @Volatile var readBytes = 0L
@@ -81,7 +82,7 @@ class TestBinder(private val broken: Boolean = false, private val bootstrapProgr
                     "traffic/read" -> { trafficQueries.incrementAndGet(); readBytes.toString() }
                     "circuit-status" -> {
                         circuitQueries.incrementAndGet()
-                        if (liveCircuit) "7 BUILT $" + "guard,$" + "middle,$" + "exit PURPOSE=GENERAL" else ""
+                        if (liveCircuit) "7 BUILT $" + "guard,$" + "middle,$" + "exit PURPOSE=$circuitPurpose" else ""
                     }
                     else -> if (bootstrapProgress == 100) "1" else "0"
                 })
@@ -126,7 +127,7 @@ fun main() {
         check(app.bindings.size == 1)
         oldBinder.die()
         awaitCondition("restart after death") { app.bindings.size == 2 }
-        val secondBinder = TestBinder()
+        val secondBinder = TestBinder(circuitPurpose = "CONFLUX_LINKED")
         app.bindings[1].onServiceConnected(null, secondBinder)
         awaitCondition("bootstrap without UI IPC") { TorProxyHelper.status == "ON" }
         oldBinder.die()
@@ -139,13 +140,33 @@ fun main() {
         refreshWithoutRestart(app, "ON")
         println("PASS: bridge refresh saves new bridges without interrupting the active connection")
 
+        val nativeChecks = org.telegram.tgnet.ConnectionsManager.pingCallbacks
+        TorProxyHelper.checkTelegramConnection()
+        TorProxyHelper.checkTelegramConnection()
+        check(nativeChecks.size == 1 && TorProxyHelper.checkingTelegram)
+        nativeChecks.last()(321)
+        awaitCondition("Telegram round trip result") { TorProxyHelper.telegramPingMs == 321L }
+        TorProxyHelper.checkTelegramConnection()
+        AndroidUtilities.advance(30_000)
+        AndroidUtilities.drain()
+        check(!TorProxyHelper.checkingTelegram && TorProxyHelper.telegramPingMs == -1L)
+        nativeChecks.last()(999)
+        AndroidUtilities.drain()
+        check(TorProxyHelper.telegramPingMs == -1L) { "Late callback overwrote timed-out check" }
+        TorProxyHelper.checkTelegramConnection()
+        val stalePing = nativeChecks.last()
+
         TorProxyHelper.stop()
         TorProxyHelper.start()
         TorProxyHelper.stop()
         secondBinder.die()
         awaitCondition("cancel queued restart") { TorProxyHelper.status == "OFF" }
+        stalePing(111)
+        AndroidUtilities.drain()
+        check(!TorProxyHelper.checkingTelegram && TorProxyHelper.telegramPingMs == -1L)
         check(app.bindings.size == 2 && !TorConfig.enabled)
         println("PASS: explicit stop cancels pending restart")
+        println("PASS: Telegram checks are on request, coalesce clicks, and ignore late callbacks after timeout/stop")
 
         TorProxyHelper.start()
         awaitCondition("third binding") { app.bindings.size == 3 }
@@ -249,10 +270,36 @@ fun main() {
         val networkBinder = TestBinder()
         app.bindings.last().onServiceConnected(null, networkBinder)
         awaitCondition("network restart connected") { TorProxyHelper.status == "ON" }
-        TorProxyHelper.stop()
+        val reserveBridge = "webtunnel 192.0.2.15:443 url=https://reserve.example.test/path"
+        val secondReserve = "webtunnel 192.0.2.16:443 url=https://second-reserve.example.test/path"
+        val slowReserve = "webtunnel 192.0.2.17:443 url=https://slow-reserve.example.test/path"
+        app.getSharedPreferences("bebragram", 0).edit()
+            .putString("inu_tor_bridges_webtunnel_standby", "${System.currentTimeMillis()}|$reserveBridge\n$secondReserve\n$slowReserve").apply()
+        IPtProxy.Controller.blockedHost = "known.example.test"
+        IPtProxy.Controller.slowHost = "slow-reserve.example.test"
+        val handoverStarted = System.nanoTime()
+        val requestsBeforeNetwork = sourceRequests.get()
+        ConnectivityManager.network = Network()
+        ConnectivityManager.callback!!.onAvailable(ConnectivityManager.network!!)
+        AndroidUtilities.drain()
+        AndroidUtilities.advance(250)
+        AndroidUtilities.drain()
+        check(TorProxyHelper.status == "STOPPING")
         networkBinder.die()
+        awaitCondition("blocked endpoint replaced on new network") { app.bindings.size == bindings + 3 }
+        check(System.nanoTime() - handoverStarted < 1_000_000_000L) { "Network handover waited for a slow third bridge" }
+        val newTorrc = TorService.getTorrc(app).readText()
+        check(!newTorrc.contains("known.example.test") && newTorrc.contains("reserve.example.test"))
+        check(sourceRequests.get() == requestsBeforeNetwork) { "Network change fetched lists despite a reachable standby" }
+        IPtProxy.Controller.blockedHost = null
+        IPtProxy.Controller.slowHost = null
+        val reserveBinder = TestBinder(circuitPurpose = "CONFLUX_LINKED")
+        app.bindings.last().onServiceConnected(null, reserveBinder)
+        awaitCondition("linked Conflux network circuit connected") { TorProxyHelper.status == "ON" }
+        TorProxyHelper.stop()
+        reserveBinder.die()
         awaitCondition("network session stopped") { TorProxyHelper.status == "OFF" }
-        println("PASS: network change reuses the connected session's bridges")
+        println("PASS: network change checks current endpoints and replaces blocked ones with cached standby; Conflux is ready")
 
         // VPN recovery must keep the actual session's bridges even after background refresh.
         TorConfig.setBridgesFor("webtunnel", knownBridge)

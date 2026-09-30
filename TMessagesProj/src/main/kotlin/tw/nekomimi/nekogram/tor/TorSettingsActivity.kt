@@ -10,6 +10,8 @@ import android.widget.TextView
 import org.telegram.messenger.AndroidUtilities
 import org.telegram.messenger.LocaleController
 import org.telegram.messenger.R
+import org.telegram.messenger.UserConfig
+import org.telegram.tgnet.ConnectionsManager
 import org.telegram.ui.ActionBar.AlertDialog
 import org.telegram.ui.ActionBar.Theme
 import org.telegram.ui.Components.BulletinFactory
@@ -43,15 +45,20 @@ class TorSettingsActivity : UniversalFragment() {
             private var lastStatus = statusText()
             private var lastEnabled = TorConfig.enabled
             private var lastError = TorProxyHelper.lastError
+            private var lastPing = TorProxyHelper.telegramPingMs
+            private var lastChecking = TorProxyHelper.checkingTelegram
 
             override fun run() {
                 val status = statusText()
                 val enabled = TorConfig.enabled
                 val error = TorProxyHelper.lastError
-                if (status != lastStatus || enabled != lastEnabled || error != lastError) {
+                if (status != lastStatus || enabled != lastEnabled || error != lastError ||
+                    lastPing != TorProxyHelper.telegramPingMs || lastChecking != TorProxyHelper.checkingTelegram) {
                     lastStatus = status
                     lastEnabled = enabled
                     lastError = error
+                    lastPing = TorProxyHelper.telegramPingMs
+                    lastChecking = TorProxyHelper.checkingTelegram
                     listView?.adapter?.update(true)
                 }
                 AndroidUtilities.runOnUIThread(this, 1000)
@@ -63,7 +70,16 @@ class TorSettingsActivity : UniversalFragment() {
 
     private fun statusText(): String = when {
         TorProxyHelper.status == "STARTING" && TorProxyHelper.progress in 0..99 -> "Starting… ${TorProxyHelper.progress}%"
-        TorProxyHelper.status == "ON" -> "Connected"
+        TorProxyHelper.status == "ON" -> {
+            val connection = ConnectionsManager.getInstance(UserConfig.selectedAccount).connectionState
+            val state = when (connection) {
+                ConnectionsManager.ConnectionStateConnected -> R.string.Connected
+                ConnectionsManager.ConnectionStateUpdating -> R.string.Updating
+                ConnectionsManager.ConnectionStateWaitingForNetwork -> R.string.WaitingForNetwork
+                else -> R.string.Connecting
+            }
+            LocaleController.formatString(R.string.BebragramTorTelegramStatus, LocaleController.getString(state))
+        }
         TorProxyHelper.status == "STOPPING" && TorConfig.enabled -> "Restarting…"
         TorProxyHelper.status == "STOPPING" -> "Stopping…"
         TorProxyHelper.status == "WAITING_FOR_NETWORK" -> "Waiting for internet…"
@@ -95,6 +111,14 @@ class TorSettingsActivity : UniversalFragment() {
         items.add(UItem.asButton(ID_AUTO, LocaleController.getString(R.string.BebragramTorAutoRefresh), autoRefreshValue()))
         items.add(UItem.asShadow(LocaleController.getString(R.string.BebragramTorFetchInfo)))
         items.add(UItem.asButton(ID_STATUS, LocaleController.getString(R.string.BebragramTorStatus), statusText()))
+        if (TorProxyHelper.status == "ON") {
+            val ping = when {
+                TorProxyHelper.checkingTelegram -> LocaleController.getString(R.string.Checking)
+                TorProxyHelper.telegramPingMs >= 0 -> LocaleController.formatString(R.string.Ping, TorProxyHelper.telegramPingMs)
+                else -> LocaleController.getString(R.string.BebragramTorCheckInfo)
+            }
+            items.add(UItem.asButton(ID_CHECK, LocaleController.getString(R.string.BebragramTorCheck), ping))
+        }
         items.add(UItem.asButton(ID_LOG, LocaleController.getString(R.string.BebragramTorLog),
             LocaleController.getString(R.string.BebragramTorLogCopy)))
         TorProxyHelper.lastError?.let {
@@ -120,6 +144,10 @@ class TorSettingsActivity : UniversalFragment() {
             ID_FETCH -> fetchBridgesNow()
             ID_AUTO -> showAutoRefreshDialog()
             ID_LOG, ID_ERROR -> showLogDialog()
+            ID_CHECK -> {
+                TorProxyHelper.checkTelegramConnection()
+                listView.adapter.update(true)
+            }
         }
     }
 
@@ -268,5 +296,6 @@ class TorSettingsActivity : UniversalFragment() {
         private const val ID_FETCH = 8
         private const val ID_AUTO = 9
         private const val ID_RESTART = 10
+        private const val ID_CHECK = 11
     }
 }

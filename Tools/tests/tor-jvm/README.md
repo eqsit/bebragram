@@ -29,3 +29,9 @@ of healthy circuits when one transport socket fails, live circuit checks despite
 a stale bootstrap success flag, no false restart during deliberate Tor dormancy,
 and standby selection without downloading a list. Brief circuit loss is allowed to
 recover in the same process; a persistent loss triggers recovery after 30 seconds.
+
+Further checks cover usable GENERAL and linked Conflux circuits (unlinked, internal
+and one-hop circuits are rejected), replacing an endpoint blocked on the new network
+with a reachable cached standby without downloading lists, and user-requested Telegram
+round trips: repeated clicks share one check, timeout clears the pending state, and
+late callbacks cannot affect a stopped/replacement session.

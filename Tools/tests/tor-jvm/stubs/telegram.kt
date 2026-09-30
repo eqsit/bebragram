@@ -2,6 +2,7 @@ package org.telegram.messenger
 import android.content.Context
 import java.util.concurrent.ConcurrentLinkedQueue
 object ApplicationLoader { lateinit var applicationContext: Context }
+object UserConfig { var selectedAccount = 0 }
 object AndroidUtilities {
     val uiThread = Thread.currentThread()
     private val queue = ConcurrentLinkedQueue<Runnable>()

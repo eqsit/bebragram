@@ -358,6 +358,9 @@
     <string name="BebragramTorNetwork">Tor network</string>
     <string name="BebragramTorEnable">Use Tor for Telegram</string>
     <string name="BebragramTorRestart">Restart Tor</string>
+    <string name="BebragramTorCheck">Check Telegram connection</string>
+    <string name="BebragramTorCheckInfo">Measure the round trip through Tor on request</string>
+    <string name="BebragramTorTelegramStatus">Tor ready; Telegram: %1$s</string>
     <string name="BebragramTorAutostart">Start Tor automatically when opening the app</string>
     <string name="BebragramTorMode">Connection mode</string>
     <string name="BebragramTorBridgeLines">Bridge lines</string>

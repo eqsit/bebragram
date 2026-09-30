@@ -343,6 +343,9 @@
     <string name="BebragramTorNetwork">Сеть Tor</string>
     <string name="BebragramTorEnable">Использовать Tor для Telegram</string>
     <string name="BebragramTorRestart">Перезапустить Tor</string>
+    <string name="BebragramTorCheck">Проверить соединение Telegram</string>
+    <string name="BebragramTorCheckInfo">Измерить отклик через Tor по запросу</string>
+    <string name="BebragramTorTelegramStatus">Tor готов; Telegram: %1$s</string>
     <string name="BebragramTorAutostart">Запускать Tor автоматически при открытии приложения</string>
     <string name="BebragramTorMode">Режим подключения</string>
     <string name="BebragramTorBridgeLines">Строки мостов</string>

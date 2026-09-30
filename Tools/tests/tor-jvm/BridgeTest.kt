@@ -1,10 +1,21 @@
 import tw.nekomimi.nekogram.tor.TorBridgeConfig
 import tw.nekomimi.nekogram.tor.TorBridgeTasks
+import tw.nekomimi.nekogram.tor.TorCircuitStatus
 import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 fun testBridgeValidationAndBudgets() {
+    val readyPath = "7 BUILT \$guard,\$middle,\$exit"
+    check(TorCircuitStatus.hasUsableCircuit("$readyPath PURPOSE=GENERAL"))
+    check(TorCircuitStatus.hasUsableCircuit("$readyPath CONFLUX_ID=ab PURPOSE=CONFLUX_LINKED BUILD_FLAGS=NEED_CAPACITY"))
+    check(!TorCircuitStatus.hasUsableCircuit("$readyPath PURPOSE=CONFLUX_UNLINKED"))
+    check(!TorCircuitStatus.hasUsableCircuit("$readyPath PURPOSE=GENERAL BUILD_FLAGS=NEED_CAPACITY,IS_INTERNAL"))
+    check(!TorCircuitStatus.hasUsableCircuit("8 BUILT \$guard PURPOSE=GENERAL BUILD_FLAGS=ONEHOP_TUNNEL"))
+    check(!TorCircuitStatus.hasUsableCircuit("$readyPath PURPOSE=CONTROLLER"))
+    check(!TorCircuitStatus.hasUsableCircuit("9 EXTENDED \$guard,\$middle,\$exit PURPOSE=GENERAL"))
+    check(!TorCircuitStatus.hasUsableCircuit(null))
+    println("PASS: linked Conflux circuits are ready; unlinked, internal and one-hop circuits are not")
     val bridge = "webtunnel [2001:db8::1]:443 0123456789ABCDEF0123456789ABCDEF01234567 url=https://bridge.example/path"
     check(TorBridgeConfig.lines("webtunnel", "# comment\nBridge\t$bridge\n$bridge").single() == bridge)
     val invalid = listOf(
