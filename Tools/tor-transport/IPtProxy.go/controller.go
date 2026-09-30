@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strings"
+	"sync"
 
 	"context"
 	"fmt"
@@ -58,6 +60,9 @@ type Controller struct {
 	transportEvents OnTransportEvents
 	listeners       map[string]*pt.SocksListener
 	shutdown        map[string]chan struct{}
+	probeMu         sync.Mutex
+	probeNext       int64
+	probeBatches    map[int64]chan struct{}
 }
 
 // NewController - Create a new Controller object.
@@ -109,6 +114,86 @@ func NewController(stateDir string, enableLogging, unsafeLogging bool, logLevel 
 // @returns the directory you set in the constructor, where transports store their state and where the log file resides.
 func (c *Controller) StateDir() string {
 	return c.stateDir
+}
+
+// ProbeWebtunnel checks the same TLS and HTTP upgrade as a real Tor connection.
+// An ordinary HTTPS response is not proof that a WebTunnel endpoint works.
+// Returns handshake time in milliseconds; closes the probe without starting Tor.
+func (c *Controller) ProbeWebtunnel(line string, timeoutMS int64) (int64, error) {
+	return c.probeWebtunnel(line, timeoutMS, make(chan struct{}))
+}
+
+// BeginProbeBatch creates a cancellable group without another Controller instance.
+func (c *Controller) BeginProbeBatch() int64 {
+	c.probeMu.Lock()
+	defer c.probeMu.Unlock()
+	if c.probeBatches == nil {
+		c.probeBatches = make(map[int64]chan struct{})
+	}
+	c.probeNext++
+	c.probeBatches[c.probeNext] = make(chan struct{})
+	return c.probeNext
+}
+
+// EndProbeBatch closes unfinished DNS/TCP/TLS/HTTP probes as soon as enough win.
+func (c *Controller) EndProbeBatch(batch int64) {
+	c.probeMu.Lock()
+	defer c.probeMu.Unlock()
+	if shutdown, ok := c.probeBatches[batch]; ok {
+		close(shutdown)
+		delete(c.probeBatches, batch)
+	}
+}
+
+// ProbeWebtunnelInBatch does not start a network request for an expired batch.
+func (c *Controller) ProbeWebtunnelInBatch(line string, timeoutMS, batch int64) (int64, error) {
+	c.probeMu.Lock()
+	shutdown, ok := c.probeBatches[batch]
+	c.probeMu.Unlock()
+	if !ok {
+		return 0, context.Canceled
+	}
+	return c.probeWebtunnel(line, timeoutMS, shutdown)
+}
+
+func (c *Controller) probeWebtunnel(line string, timeoutMS int64, shutdown <-chan struct{}) (int64, error) {
+	select {
+	case <-shutdown:
+		return 0, context.Canceled
+	default:
+	}
+	parts := strings.Fields(line)
+	if len(parts) > 0 && parts[0] == "Bridge" {
+		parts = parts[1:]
+	}
+	if len(parts) < 3 || parts[0] != Webtunnel || timeoutMS < 1 || timeoutMS > 15000 {
+		return 0, errors.New("invalid WebTunnel probe")
+	}
+	args := make(pt.Args)
+	for _, part := range parts[2:] {
+		key, value, ok := strings.Cut(part, "=")
+		if ok {
+			args.Add(key, value)
+		}
+	}
+	if _, ok := args.Get("url"); !ok {
+		return 0, errors.New("WebTunnel URL is required")
+	}
+	f, err := webtunnel.Transport.ClientFactory(c.stateDir)
+	if err != nil {
+		return 0, err
+	}
+	parsed, err := f.ParseArgs(&args)
+	if err != nil {
+		return 0, err
+	}
+	start := time.Now()
+	conn, err := dialTransport(f, parts[1], nil, parsed, shutdown, time.Duration(timeoutMS)*time.Millisecond)
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+	return time.Since(start).Milliseconds(), nil
 }
 
 // addExtraArgs adds the args in extraArgs to the connection args
@@ -244,8 +329,9 @@ func dialTransport(f base.ClientFactory, target string, proxyURL *url.URL, args 
 	if stopClosing != nil {
 		stopClosing()
 	}
-	if err == nil {
-		err = ctx.Err()
+	if contextErr := ctx.Err(); contextErr != nil {
+		// Report the timeout/cancellation, rather than the socket error caused by it.
+		err = contextErr
 	}
 	if err != nil {
 		if raw != nil {

@@ -23,6 +23,13 @@ upgrade. Stopping the transport cancels a pending handshake. Failed handshakes
 and failed SOCKS replies close the underlying socket. Established sockets do not
 inherit the setup deadline.
 
+Bridge selection calls `Controller.ProbeWebtunnel` through the same Lyrebird
+TLS/HTTP-upgrade code used by Tor, with a 3.5-second per-probe setup budget and
+one 4-second budget for the candidate batch. Only a valid `101 Switching Protocols`
+response passes; normal web pages and HTTP errors do not. Certificate verification
+and bridge certificate pins remain enforced. This verifies the tunnel front end;
+Tor bootstrap still verifies the relay and builds a circuit.
+
 The Gradle `buildTorTransport` task builds all four Android ABIs automatically;
 CI installs Go and NDK 28.2.13676358. Local prerequisites: Go, JDK 21, Android SDK
 and `sdkmanager 'ndk;28.2.13676358'`. Override `ANDROID_NDK_HOME` if needed.
@@ -44,3 +51,5 @@ and the TLS-version weight adjustment.
 The controller tests use local sockets to verify stalled-handshake deadlines,
 shutdown cancellation, socket cleanup on errors and socket survival after a
 successful handshake. `go list -deps .` must not include Snowflake or WebRTC.
+Probe regressions verify rejection of HTTP 200/404, successful HTTP upgrade,
+trusted versus incorrect certificate pins, and stalled HTTP-upgrade timeouts.

@@ -342,6 +342,7 @@
     <!-- bebragram: встроенный Tor -->
     <string name="BebragramTorNetwork">Сеть Tor</string>
     <string name="BebragramTorEnable">Использовать Tor для Telegram</string>
+    <string name="BebragramTorRestart">Перезапустить Tor</string>
     <string name="BebragramTorAutostart">Запускать Tor автоматически при открытии приложения</string>
     <string name="BebragramTorMode">Режим подключения</string>
     <string name="BebragramTorBridgeLines">Строки мостов</string>
@@ -356,7 +357,7 @@
     <string name="BebragramTorError">Последняя ошибка</string>
     <string name="BebragramTorHelp">Tor подключается до включения прокси Telegram. Другие прокси восстанавливаются при отключении Tor. Звонки и встроенные веб-страницы не гарантированно идут через Tor.</string>
     <string name="BebragramTorFetch">Получить мосты</string>
-    <string name="BebragramTorFetchInfo">Проверяются до 12 кандидатов из списков GitHub, сохраняются три доступных моста. Соединение проверяет сам Tor.</string>
+    <string name="BebragramTorFetchInfo">Проверяются до 12 кандидатов из списков GitHub, сохраняются до шести мостов на разных адресах. Соединение проверяет сам Tor; проверки выполняются при подборе и восстановлении.</string>
     <string name="BebragramTorAutoRefresh">Автообновление мостов</string>
     <string name="BebragramTorAutoOff">Выкл</string>
     <string name="BebragramTorAutoCustom">Другое…</string>

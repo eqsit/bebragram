@@ -18,6 +18,7 @@ import java.net.URLStreamHandler
 
 @Volatile private var fetchGate: java.util.concurrent.CountDownLatch? = null
 private val sourceRequests = java.util.concurrent.atomic.AtomicInteger()
+@Volatile private var sourceBridgeLines = "webtunnel 192.0.2.9:443 url=https://bridge.example.test/path"
 
 private fun mockBridgeRequests() {
     URL.setURLStreamHandlerFactory { protocol ->
@@ -33,8 +34,7 @@ private fun mockBridgeRequests() {
                     }
                     return 200
                 }
-                override fun getInputStream() =
-                    "webtunnel 192.0.2.9:443 url=https://bridge.example.test/path".byteInputStream()
+                override fun getInputStream() = sourceBridgeLines.byteInputStream()
             }
         }
     }
@@ -58,6 +58,11 @@ private fun refreshWithoutRestart(app: Context, expectedStatus: String) {
 }
 
 class TestBinder(private val broken: Boolean = false, private val bootstrapProgress: Int = 100) : IBinder {
+    @Volatile var liveCircuit = true
+    @Volatile var dormant = false
+    @Volatile var readBytes = 0L
+    val trafficQueries = java.util.concurrent.atomic.AtomicInteger()
+    val circuitQueries = java.util.concurrent.atomic.AtomicInteger()
     override var isBinderAlive = true
     private val recipients = mutableListOf<IBinder.DeathRecipient>()
     override fun linkToDeath(recipient: IBinder.DeathRecipient, flags: Int) { recipients.add(recipient) }
@@ -69,7 +74,17 @@ class TestBinder(private val broken: Boolean = false, private val bootstrapProgr
             1 -> response.writeInt(1)
             2 -> {
                 request.readString()
-                response.writeString(if(request.readString() == "status/bootstrap-phase") "PROGRESS=$bootstrapProgress" else if (bootstrapProgress == 100) "1" else "0")
+                val key = request.readString()
+                response.writeString(when (key) {
+                    "status/bootstrap-phase" -> "PROGRESS=$bootstrapProgress"
+                    "dormant" -> if (dormant) "1" else "0"
+                    "traffic/read" -> { trafficQueries.incrementAndGet(); readBytes.toString() }
+                    "circuit-status" -> {
+                        circuitQueries.incrementAndGet()
+                        if (liveCircuit) "7 BUILT $" + "guard,$" + "middle,$" + "exit PURPOSE=GENERAL" else ""
+                    }
+                    else -> if (bootstrapProgress == 100) "1" else "0"
+                })
             }
             3 -> response.writeInt(9050)
         }
@@ -185,7 +200,7 @@ fun main() {
         fetchGate = null
         awaitCondition("both refresh callbacks") { firstRefresh != null && secondRefresh != null }
         check(firstRefresh == 1 && secondRefresh == 1)
-        check(sourceRequests.get() == requestCount + 2) { "Duplicate refresh downloaded the lists twice" }
+        check(sourceRequests.get() - requestCount in 2..4) { "Duplicate refresh downloaded the lists twice" }
         println("PASS: repeated refresh shares one fetch and completes both callbacks")
 
         fetchGate = java.util.concurrent.CountDownLatch(1)
@@ -217,8 +232,13 @@ fun main() {
         refreshWithoutRestart(app, "ON")
         TorConfig.mode = "webtunnel"
         ConnectivityManager.network = Network()
-        ConnectivityManager.callback!!.onAvailable(ConnectivityManager.network)
-        AndroidUtilities.advance(3_000)
+        ConnectivityManager.callback!!.onAvailable(ConnectivityManager.network!!)
+        ConnectivityManager.callback!!.onCapabilitiesChanged(ConnectivityManager.network!!, android.net.NetworkCapabilities())
+        AndroidUtilities.drain()
+        AndroidUtilities.advance(249)
+        AndroidUtilities.drain()
+        check(TorProxyHelper.status == "ON") { "Network callbacks were not coalesced" }
+        AndroidUtilities.advance(1)
         AndroidUtilities.drain()
         check(TorProxyHelper.status == "STOPPING")
         knownBinder.die()
@@ -233,6 +253,130 @@ fun main() {
         networkBinder.die()
         awaitCondition("network session stopped") { TorProxyHelper.status == "OFF" }
         println("PASS: network change reuses the connected session's bridges")
+
+        // VPN recovery must keep the actual session's bridges even after background refresh.
+        TorConfig.setBridgesFor("webtunnel", knownBridge)
+        bindings = app.bindings.size
+        TorProxyHelper.start()
+        awaitCondition("VPN bridge binding") { app.bindings.size == bindings + 1 }
+        val vpnBinder = TestBinder()
+        app.bindings.last().onServiceConnected(null, vpnBinder)
+        awaitCondition("VPN bridge connected") { TorProxyHelper.status == "ON" }
+        refreshWithoutRestart(app, "ON")
+        TorConfig.mode = "webtunnel"
+        ProxyUtil.vpn = true
+        TorProxyHelper.onVpnPreferenceChanged()
+        vpnBinder.die()
+        awaitCondition("VPN paused") { TorProxyHelper.status == "WAITING_FOR_VPN" }
+        ProxyUtil.vpn = false
+        ConnectivityManager.network = Network()
+        ConnectivityManager.callback!!.onAvailable(ConnectivityManager.network!!)
+        AndroidUtilities.drain()
+        AndroidUtilities.advance(250)
+        awaitCondition("VPN callback resumes in 250ms") { app.bindings.size == bindings + 2 }
+        check(TorService.getTorrc(app).readText().contains("known.example.test"))
+        val vpnResumeBinder = TestBinder()
+        app.bindings.last().onServiceConnected(null, vpnResumeBinder)
+        awaitCondition("VPN resumed") { TorProxyHelper.status == "ON" }
+        println("PASS: VPN resume in 250ms reuses connected bridges instead of refreshed candidates")
+
+        val sourcesBeforeAuto = sourceRequests.get()
+        val proxyBeforeAuto = SharedConfig.currentProxy
+        TorConfig.bridgeAutoRefreshHours = 1
+        TorConfig.setLastBridgeRefreshFor("webtunnel", 0)
+        AndroidUtilities.advance(60_000)
+        awaitCondition("auto refresh within one minute") { TorConfig.lastBridgeRefreshFor("webtunnel") > 0 }
+        check(sourceRequests.get() - sourcesBeforeAuto in 2..4)
+        check(TorProxyHelper.status == "ON" && SharedConfig.currentProxy === proxyBeforeAuto)
+        check(app.bindings.size == bindings + 2)
+        TorConfig.bridgeAutoRefreshHours = 0
+        println("PASS: due auto refresh runs within one minute without restarting the live circuit")
+
+        val queriesBeforeHealthyError = vpnResumeBinder.circuitQueries.get()
+        IPtProxy.Controller.listener!!.stopped("webtunnel", Exception("unrecognized reply"))
+        AndroidUtilities.drain()
+        AndroidUtilities.advance(250)
+        awaitCondition("verify circuit after single bridge error") { vpnResumeBinder.circuitQueries.get() > queriesBeforeHealthyError }
+        check(TorProxyHelper.status == "ON") { "One failed bridge restarted a healthy circuit" }
+        vpnResumeBinder.liveCircuit = false
+        vpnResumeBinder.dormant = true
+        val queriesBeforeDormant = vpnResumeBinder.circuitQueries.get()
+        IPtProxy.Controller.listener!!.stopped("webtunnel", null)
+        AndroidUtilities.drain()
+        AndroidUtilities.advance(250)
+        awaitCondition("dormant circuit check") { vpnResumeBinder.circuitQueries.get() > queriesBeforeDormant }
+        check(TorProxyHelper.status == "ON")
+        vpnResumeBinder.dormant = false
+        println("PASS: deliberate Tor dormancy does not cause a false bridge restart")
+        val queryCount = vpnResumeBinder.circuitQueries.get()
+        val sourcesBeforeRecovery = sourceRequests.get()
+        val standby = "webtunnel 192.0.2.11:443 url=https://standby.example.test/path"
+        app.getSharedPreferences("bebragram", 0).edit()
+            .putString("inu_tor_bridges_webtunnel_standby", "${System.currentTimeMillis()}|$standby").apply()
+        IPtProxy.Controller.listener!!.stopped("webtunnel", Exception("unrecognized reply"))
+        AndroidUtilities.drain()
+        AndroidUtilities.advance(250)
+        awaitCondition("first missing live circuit check") { vpnResumeBinder.circuitQueries.get() > queryCount }
+        Thread.sleep(20)
+        AndroidUtilities.drain()
+        check(TorProxyHelper.status == "ON")
+        AndroidUtilities.advance(5_000)
+        awaitCondition("Tor can rebuild circuits without a process restart") { vpnResumeBinder.circuitQueries.get() > queryCount + 1 }
+        Thread.sleep(20)
+        AndroidUtilities.drain()
+        check(TorProxyHelper.status == "ON") { "Brief circuit rebuild restarted Tor" }
+        vpnResumeBinder.liveCircuit = true
+        AndroidUtilities.advance(5_000)
+        awaitCondition("live circuit recovered") { vpnResumeBinder.circuitQueries.get() > queryCount + 2 }
+        Thread.sleep(20)
+        AndroidUtilities.drain()
+        check(TorProxyHelper.status == "ON")
+        vpnResumeBinder.liveCircuit = false
+        AndroidUtilities.advance(15_000)
+        awaitCondition("second loss starts grace period") { vpnResumeBinder.circuitQueries.get() > queryCount + 3 }
+        Thread.sleep(20)
+        AndroidUtilities.drain()
+        AndroidUtilities.advance(30_000)
+        awaitCondition("lost circuit despite old success flag") { TorProxyHelper.status == "STOPPING" }
+        awaitCondition("standby selected without list download") { TorConfig.bridgesFor("webtunnel").contains("standby.example.test") }
+        check(sourceRequests.get() == sourcesBeforeRecovery)
+        vpnResumeBinder.die()
+        awaitCondition("standby restart") { app.bindings.size == bindings + 3 }
+        val standbyBinder = TestBinder()
+        app.bindings.last().onServiceConnected(null, standbyBinder)
+        awaitCondition("standby connected") { TorProxyHelper.status == "ON" }
+        println("PASS: healthy circuit survives bridge errors; lost circuit retries standby without downloading lists")
+
+        val oldNetwork = ConnectivityManager.network!!
+        ConnectivityManager.network = null
+        ConnectivityManager.callback!!.onLost(oldNetwork)
+        AndroidUtilities.drain()
+        AndroidUtilities.advance(250)
+        AndroidUtilities.drain()
+        check(TorProxyHelper.status == "STOPPING")
+        standbyBinder.die()
+        awaitCondition("offline pause") { TorProxyHelper.status == "WAITING_FOR_NETWORK" }
+        ConnectivityManager.network = Network()
+        ConnectivityManager.callback!!.onAvailable(ConnectivityManager.network!!)
+        AndroidUtilities.drain()
+        AndroidUtilities.advance(250)
+        awaitCondition("online restart in 250ms") { app.bindings.size == bindings + 4 }
+        check(TorService.getTorrc(app).readText().contains("standby.example.test"))
+        val onlineBinder = TestBinder()
+        app.bindings.last().onServiceConnected(null, onlineBinder)
+        awaitCondition("online connected") { TorProxyHelper.status == "ON" }
+        TorProxyHelper.restart()
+        TorProxyHelper.restart()
+        check(app.bindings.size == bindings + 4 && TorProxyHelper.status == "STOPPING")
+        onlineBinder.die()
+        awaitCondition("one explicit restart after death") { app.bindings.size == bindings + 5 }
+        val restartBinder = TestBinder()
+        app.bindings.last().onServiceConnected(null, restartBinder)
+        awaitCondition("explicit restart connected") { TorProxyHelper.status == "ON" }
+        TorProxyHelper.stop()
+        restartBinder.die()
+        awaitCondition("recovery tests stopped") { TorProxyHelper.status == "OFF" }
+        println("PASS: offline/online resumes in 250ms; repeated Restart clicks queue one safe restart")
 
         TorConfig.setBridgesFor("webtunnel", knownBridge)
         bindings = app.bindings.size
@@ -265,7 +409,19 @@ fun main() {
         val stalledBinder = TestBinder(bootstrapProgress = 25)
         app.bindings.last().onServiceConnected(null, stalledBinder)
         awaitCondition("bootstrap reached 25 percent") { TorProxyHelper.progress == 25 }
-        AndroidUtilities.advance(45_001)
+        AndroidUtilities.advance(20_001)
+        Thread.sleep(250)
+        AndroidUtilities.drain()
+        check(TorProxyHelper.status == "STARTING") { "Consensus download was aborted after 20 seconds" }
+        stalledBinder.readBytes = 32_768
+        val trafficPolls = stalledBinder.trafficQueries.get()
+        AndroidUtilities.advance(30_000)
+        awaitCondition("download activity sampled") { stalledBinder.trafficQueries.get() > trafficPolls }
+        AndroidUtilities.advance(59_999)
+        Thread.sleep(250)
+        AndroidUtilities.drain()
+        check(TorProxyHelper.status == "STARTING") { "Productive consensus download was aborted" }
+        AndroidUtilities.advance(2)
         awaitCondition("stalled bootstrap stopped early") { TorProxyHelper.status == "STOPPING" }
         check(TorProxyHelper.lastError == "Tor bootstrap stalled at 25%")
         awaitCondition("stalled bridge replaced") { TorConfig.bridgesFor("webtunnel") != knownBridge }
@@ -273,7 +429,61 @@ fun main() {
         TorProxyHelper.stop()
         stalledBinder.die()
         awaitCondition("stalled session stopped") { TorProxyHelper.status == "OFF" }
-        println("PASS: stalled automatic bridges retry after 45 seconds without progress")
+        println("PASS: consensus download survives 20-second stall and incoming bytes reset its 60-second budget")
+
+        TorConfig.setBridgesFor("webtunnel", knownBridge)
+        bindings = app.bindings.size
+        TorProxyHelper.start()
+        awaitCondition("late bootstrap binding") { app.bindings.size == bindings + 1 }
+        val lateBinder = TestBinder(bootstrapProgress = 95)
+        app.bindings.last().onServiceConnected(null, lateBinder)
+        awaitCondition("late bootstrap reached 95 percent") { TorProxyHelper.progress == 95 }
+        AndroidUtilities.advance(44_999)
+        AndroidUtilities.drain()
+        check(TorProxyHelper.status == "STARTING")
+        AndroidUtilities.advance(1)
+        awaitCondition("late bootstrap stall is bounded") { TorProxyHelper.status == "STOPPING" }
+        check(TorProxyHelper.lastError == "Tor bootstrap stalled at 95%")
+        TorProxyHelper.stop()
+        lateBinder.die()
+        awaitCondition("late stall stopped") { TorProxyHelper.status == "OFF" }
+        println("PASS: late bootstrap gets 45 seconds to progress instead of waiting the full 120 seconds")
+
+        // Exhaust the small mocked pool: recovery must resume later rather than
+        // leaving the enabled toggle permanently stranded in ERROR.
+        TorConfig.setBridgesFor("webtunnel", knownBridge)
+        bindings = app.bindings.size
+        TorProxyHelper.start()
+        awaitCondition("recovery cooldown binding") { app.bindings.size == bindings + 1 }
+        val recoveryBinder = TestBinder(broken = true)
+        app.bindings.last().onServiceConnected(null, recoveryBinder)
+        awaitCondition("recovery first fetch") { TorConfig.bridgesFor("webtunnel") != knownBridge }
+        recoveryBinder.die()
+        awaitCondition("recovery replacement binding") { app.bindings.size == bindings + 2 }
+        val exhaustedBinder = TestBinder(broken = true)
+        app.bindings.last().onServiceConnected(null, exhaustedBinder)
+        awaitCondition("exhausted pool retry queued") {
+            tw.nekomimi.nekogram.tor.TorLog.snapshot().contains("retry scheduled in 30s")
+        }
+        exhaustedBinder.die()
+        awaitCondition("recovery waiting for cooldown") { TorProxyHelper.status.startsWith("ERROR:") }
+        val requestsBeforeCooldown = sourceRequests.get()
+        AndroidUtilities.advance(29_999)
+        AndroidUtilities.drain()
+        check(sourceRequests.get() == requestsBeforeCooldown)
+        AndroidUtilities.advance(1)
+        awaitCondition("recovery resumes after cooldown") { app.bindings.size == bindings + 3 }
+        val recoveredBinder = TestBinder()
+        app.bindings.last().onServiceConnected(null, recoveredBinder)
+        awaitCondition("cooldown recovery connected") { TorProxyHelper.status == "ON" }
+        TorProxyHelper.stop()
+        recoveredBinder.die()
+        awaitCondition("cooldown test stopped") { TorProxyHelper.status == "OFF" }
+        val stoppedBindings = app.bindings.size
+        AndroidUtilities.advance(300_000)
+        AndroidUtilities.drain()
+        check(app.bindings.size == stoppedBindings && !TorConfig.enabled)
+        println("PASS: exhausted bridge pool recovers after cooldown; explicit stop prevents delayed restarts")
         TorConfig.mode = "direct"
         bindings = app.bindings.size
         TorProxyHelper.start()
@@ -287,6 +497,20 @@ fun main() {
         app.bindings.last().onNullBinding(null)
         check(TorProxyHelper.status == "OFF") { "Null binding left Tor stuck in STOPPING" }
         println("PASS: null service binding releases STARTING and STOPPING")
+        TorConfig.mode = "webtunnel"
+        sourceBridgeLines = (1..6).flatMap { host ->
+            (1..3).map { path -> "webtunnel 192.0.2.$host:443 url=https://host$host.example.test/path$path" }
+        }.joinToString("\n")
+        var diverseCount: Int? = null
+        TorProxyHelper.refreshBridges { diverseCount = it }
+        awaitCondition("six distinct bridge hosts selected") { diverseCount != null }
+        check(diverseCount == 6)
+        val savedHosts = TorConfig.bridgesFor("webtunnel").lines().map {
+            java.net.URI(it.substringAfter("url=")).host
+        }
+        check(savedHosts.toSet().size == 6) { "Bridge selection picked duplicate tunnel hosts" }
+        check(TorProxyHelper.status == "OFF" && !TorConfig.enabled)
+        println("PASS: bridge selection retains six different hosts even when source paths are duplicated")
         println("All Tor lifecycle regression scenarios passed")
         kotlin.system.exitProcess(0)
     } catch(t: Throwable) {

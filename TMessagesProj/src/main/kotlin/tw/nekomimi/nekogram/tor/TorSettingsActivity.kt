@@ -86,6 +86,9 @@ class TorSettingsActivity : UniversalFragment() {
             .setChecked(TorConfig.enabled))
         items.add(UItem.asCheck(ID_AUTOSTART, LocaleController.getString(R.string.BebragramTorAutostart))
             .setChecked(TorConfig.autostart))
+        if (TorConfig.enabled) {
+            items.add(UItem.asButton(ID_RESTART, LocaleController.getString(R.string.BebragramTorRestart)).accent())
+        }
         items.add(UItem.asButton(ID_BRIDGES, LocaleController.getString(R.string.BebragramTorBridgeLines), bridgeSummary()))
         items.add(UItem.asShadow(LocaleController.getString(R.string.BebragramTorHelp)))
         items.add(UItem.asButton(ID_FETCH, LocaleController.getString(R.string.BebragramTorFetch)).accent())
@@ -107,6 +110,10 @@ class TorSettingsActivity : UniversalFragment() {
             }
             ID_AUTOSTART -> {
                 TorConfig.autostart = !TorConfig.autostart
+                listView.adapter.update(true)
+            }
+            ID_RESTART -> {
+                TorProxyHelper.restart()
                 listView.adapter.update(true)
             }
             ID_BRIDGES -> showBridgeDialog()
@@ -260,5 +267,6 @@ class TorSettingsActivity : UniversalFragment() {
         private const val ID_ERROR = 7
         private const val ID_FETCH = 8
         private const val ID_AUTO = 9
+        private const val ID_RESTART = 10
     }
 }

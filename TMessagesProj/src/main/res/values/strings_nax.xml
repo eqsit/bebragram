@@ -357,6 +357,7 @@
     <!-- bebragram: embedded Tor -->
     <string name="BebragramTorNetwork">Tor network</string>
     <string name="BebragramTorEnable">Use Tor for Telegram</string>
+    <string name="BebragramTorRestart">Restart Tor</string>
     <string name="BebragramTorAutostart">Start Tor automatically when opening the app</string>
     <string name="BebragramTorMode">Connection mode</string>
     <string name="BebragramTorBridgeLines">Bridge lines</string>
@@ -371,7 +372,7 @@
     <string name="BebragramTorError">Last error</string>
     <string name="BebragramTorHelp">Tor connects before the Telegram proxy is enabled. Other proxies are restored when Tor is turned off. Calls and embedded web pages are not guaranteed to use Tor.</string>
     <string name="BebragramTorFetch">Get bridges</string>
-    <string name="BebragramTorFetchInfo">Checks up to 12 candidates from GitHub lists and keeps three responsive bridges. Tor verifies the connection.</string>
+    <string name="BebragramTorFetchInfo">Checks up to 12 candidates from GitHub lists and keeps up to six bridges on different hosts. Tor verifies the connection; checks run during selection and recovery.</string>
     <string name="BebragramTorAutoRefresh">Auto-refresh bridges</string>
     <string name="BebragramTorAutoOff">Off</string>
     <string name="BebragramTorAutoCustom">Custom…</string>

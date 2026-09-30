@@ -447,6 +447,10 @@ public class ApplicationLoader extends Application {
     @Override
     public void onConfigurationChanged(Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
+        // This process intentionally has no Telegram JNI/account initialization.
+        if (tw.nekomimi.nekogram.tor.TorProxyHelper.isTorProcess()) {
+            return;
+        }
         try {
             LocaleController.getInstance().onDeviceConfigurationChange(newConfig);
             AndroidUtilities.checkDisplaySize(applicationContext, newConfig);

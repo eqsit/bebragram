@@ -9,7 +9,9 @@ old death and stale error broadcasts; no synchronous Binder IPC on UI; cancellat
 of a queued restart; control exceptions; unexpected process death; VPN pause/resume;
 default autostart and explicit opt-out; bridge downloads preserve an established
 connection; manual refresh retries an unfinished bootstrap; network changes reuse
-the connected session's bridges; automatic bootstrap stalls retry after 45 seconds.
+the connected session's bridges; initial transport stalls retry after 20 seconds,
+consensus/descriptor downloads get 60 seconds without progress (incoming data resets
+that budget), and stalls at 80–100% retry after 45 seconds without progress.
 HTTPS requests and the monotonic clock are stubbed locally. Android/device behavior still needs an APK
 smoke test; this harness does not simulate Android's process manager or native Tor.
 
@@ -19,3 +21,11 @@ Snowflake preferences, one deadline for a batch of stalled endpoints, fast resul
 behind slow requests, coalesced manual refresh, cancellation without waiting for
 the network, and null service bindings. Network stubs intentionally do not report
 Android VALIDATED, to check that blocked connectivity probes do not prevent Tor.
+
+Recovery regressions cover 250 ms coalescing of network events, reuse of the live
+session's bridges after VPN and offline/online transitions, one safe restart for
+repeated Restart clicks, one-minute checks for due background refresh, preservation
+of healthy circuits when one transport socket fails, live circuit checks despite
+a stale bootstrap success flag, no false restart during deliberate Tor dormancy,
+and standby selection without downloading a list. Brief circuit loss is allowed to
+recover in the same process; a persistent loss triggers recovery after 30 seconds.

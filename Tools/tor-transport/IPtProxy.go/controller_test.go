@@ -1,9 +1,14 @@
 package IPtProxy
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -122,5 +127,64 @@ func TestDialSuccessKeepsSocketOpen(t *testing.T) {
 	b := make([]byte, 1)
 	if _, err := io.ReadFull(peer, b); err != nil || b[0] != 42 {
 		t.Fatalf("successful socket closed: %v", err)
+	}
+}
+
+func TestProbeRequiresWebTunnelUpgrade(t *testing.T) {
+	for _, status := range []int{200, 404, 101} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Connection") != "upgrade" || r.Header.Get("Upgrade") != "websocket" || r.URL.Path != "/secret" {
+					t.Errorf("probe did not use the WebTunnel handshake")
+				}
+				if status == 101 {
+					w.Header().Set("Connection", "upgrade")
+					w.Header().Set("Upgrade", "websocket")
+				}
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+			c := &Controller{stateDir: t.TempDir()}
+			_, err := c.ProbeWebtunnel("webtunnel 192.0.2.1:443 url=http://bridge.example/secret addr="+server.Listener.Addr().String(), 1000)
+			if (err == nil) != (status == 101) {
+				t.Fatalf("HTTP %d: probe error %v", status, err)
+			}
+		})
+	}
+}
+
+func TestProbeVerifiesTLSCertificate(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Connection", "upgrade")
+		w.Header().Set("Upgrade", "websocket")
+		w.WriteHeader(101)
+	}))
+	defer server.Close()
+	c := &Controller{stateDir: t.TempDir()}
+	line := "webtunnel 192.0.2.1:443 url=https://bridge.example/secret addr=" + server.Listener.Addr().String()
+	// A self-signed certificate must fail unless the supplied bridge pins it.
+	if _, err := c.ProbeWebtunnel(line, 1000); err == nil {
+		t.Fatal("untrusted certificate accepted without a pin")
+	}
+	hash := sha256.Sum256(server.Certificate().Raw)
+	if _, err := c.ProbeWebtunnel(line+" cert="+base64.StdEncoding.EncodeToString(hash[:]), 1000); err != nil {
+		t.Fatalf("correct certificate pin failed: %v", err)
+	}
+	hash[0] ^= 1
+	if _, err := c.ProbeWebtunnel(line+" cert="+base64.StdEncoding.EncodeToString(hash[:]), 1000); err == nil {
+		t.Fatal("wrong certificate pin accepted")
+	}
+}
+
+func TestProbeStalledUpgradeTimesOut(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	c := &Controller{stateDir: t.TempDir()}
+	start := time.Now()
+	_, err := c.ProbeWebtunnel("webtunnel 192.0.2.1:443 url=http://bridge.example/secret addr="+server.Listener.Addr().String(), 100)
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
+		t.Fatalf("stalled HTTP upgrade: %v", err)
 	}
 }
